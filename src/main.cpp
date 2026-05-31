@@ -148,11 +148,28 @@ void printTimeoutStats()
   Serial.println(timeoutsNet);
 }
 
-void beep(int duration)
+// Play a short melody from an array of {frequency, duration} pairs.
+// A frequency of 0 produces a silent rest of the given duration.
+void playTune(const int notes[][2], int count)
 {
-    sys.buzzer(2000);
-    delay(duration);
+    for (int i = 0; i < count; i++) {
+        sys.buzzer(notes[i][0]);
+        delay(notes[i][1]);
+    }
     sys.buzzer(0);
+}
+
+// Cheerful rising arpeggio played when the cellular link comes up.
+// Notes: C6, E6, G6, C7 (a C-major chord) with a final bright accent.
+void chimeConnected()
+{
+    static const int tune[][2] = {
+        {1047, 70},   // C6
+        {1319, 70},   // E6
+        {1568, 70},   // G6
+        {2093, 130},  // C7 (held a touch longer)
+    };
+    playTune(tune, sizeof(tune) / sizeof(tune[0]));
 }
 
 /*******************************************************************************
@@ -839,7 +856,7 @@ void telemetry(void* inst)
         }
         Serial.println("[CELL] In service");
         state.set(STATE_NET_READY);
-        beep(50);
+        chimeConnected();
       }
 
       if (millis() - lastRssiTime > SIGNAL_CHECK_INTERVAL * 1000) {
@@ -865,10 +882,6 @@ void telemetry(void* inst)
       Serial.print("[DAT] ");
       Serial.println(store.buffer());
 
-#ifdef PIN_LED
-      if (ledMode == 0) digitalWrite(PIN_LED, HIGH);
-#endif
-
       if (teleClient.transmit(store.buffer(), store.length())) {
         connErrors = 0;
         showStats();
@@ -880,9 +893,6 @@ void telemetry(void* inst)
           teleClient.connect(true);
         }
       }
-#ifdef PIN_LED
-      if (ledMode == 0) digitalWrite(PIN_LED, LOW);
-#endif
       store.purge();
 
       teleClient.inbound();

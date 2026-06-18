@@ -103,11 +103,19 @@ static void softSerialTx(uint32_t baudrate, uint8_t c)
 
 static void gps_soft_decode_task(void* inst)
 {
-    // start receiving and decoding
+    // Wait-for-start-bit loop must vTaskDelay periodically (not just taskYIELD)
+    // because taskYIELD at priority 1 never schedules IDLE0 (priority 0), so an
+    // idle GPS line starves IDLE0 -> task watchdog -> reboot loop. 1ms occasional
+    // delay costs at most one byte of latency between NMEA messages.
+    uint32_t spinCount = 0;
     for (;;) {
         uint8_t c = 0;
         do {
-            taskYIELD();
+            if ((++spinCount & 0x3FF) == 0) {
+                vTaskDelay(1);
+            } else {
+                taskYIELD();
+            }
         } while (readRxPin());
         uint32_t start = getCycleCount();
         uint32_t duration;

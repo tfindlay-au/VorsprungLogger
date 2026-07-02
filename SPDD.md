@@ -417,7 +417,117 @@ On this throttle-less diesel, `0x103C` IMAP ≈ ambient at idle is correct.
 
 ---
 
-## 16. Build & Flash
+## 16. Field Observations — GNSS Reliability Baseline (pre-external-antenna)
+
+> **Snapshot: 2026-06-01.** This is a *measured baseline*, not a design decision —
+> it records the GNSS behaviour of the **internal antenna** (co-processor
+> `GNSS:OK(I)` path, §9) so a future re-log after the external antenna is fitted
+> can be compared against the same numbers. Re-run the analysis after ~1 week of
+> driving and update this section with an "after" column.
+
+**Dataset:** full SD card dump (`/DATA/*.CSV`), 104 of 121 files non-empty,
+**52,346 logged cycles**. The 17 empty/near-empty files are reboot/wake churn
+(each file is one session between `ESP.restart()` events, §11).
+
+**Method (reproducible):** flat `PID,value` lines are grouped into per-cycle
+records (a new cycle begins whenever a PID repeats, since no PID appears twice in
+a cycle). A record "has a fix" if it carries both `A` (lat) and `B` (lng). The
+key trick is using **OBD vehicle speed `10D` as an independent motion reference**
+— it tells us the car was moving even when GNSS produced nothing, which
+separates "no fix while driving" from "parked / cold-starting."
+
+**Findings:**
+
+- **39.9 %** of all cycles (20,870 / 52,346) carried **no position**, while OBD
+  logged normally — so the device was alive and writing to SD throughout.
+- **35.7 %** of *moving* cycles (OBD speed ≥ 5 km/h) had **no fix** (13,899 /
+  38,921). This is position loss while genuinely driving, not while stationary.
+- The failure is **bimodal, not gradual.** Of 58 real drives (files with ≥ 20
+  OBD-speed samples): **33 good** (≥ 50 % coverage), **9 partial**, **16 with
+  zero fix for the entire drive** (files 12–15, 18, 19, 21, 23, 25–28, 36, 38, 66,
+  120). Examples: `21.CSV` — 1848 records, 0 fixes, up to 82 km/h; `25.CSV` — up
+  to 111 km/h, 0 fixes.
+- **When it does lock, reception is healthy:** satellite count peaks at 9–12
+  (18,539 samples at 12 sats), HDOP good (remember the wire value is HDOP × 10,
+  §9). Gradual signal weakness would show many marginal 3–4-sat fixes; we don't
+  see that. "Solid lock or total silence" is the signature of an **intermittent
+  antenna / connector (or GNSS failing to init on some boots)** — not a
+  reception-quality problem. The zero-fix drives cluster (files 12–28), consistent
+  with a physical connection bad for a stretch.
+- **Standby churn amplifies it.** With `GNSS_ALWAYS_ON = 0` (§11), GPS cold-starts
+  on every wake (TTFF ≈ 69 s per §9). Several files take 400–600 cycles to their
+  first fix, and short post-wake segments end before a fix ever arrives.
+
+**Conclusion — the core issue is lost *fix*, not lost *transmission*.** The gaps
+seen at the Traccar server are also gaps on the SD card: the position was never
+captured, so there was nothing to transmit. This was the question that drove the
+analysis, and it settles the solution space:
+
+- **Cellular GNSS would not help** — it is the modem's own *satellite* receiver
+  (and unimplemented for the SIM7670G anyway, §9); same failure mode, different
+  antenna.
+- **Store-and-forward / SD backfill would not have helped** — nothing was logged
+  to forward.
+- **External GNSS antenna (pending)** targets the root cause directly; expected to
+  be the primary fix. Check the physical connector too — the bimodal pattern
+  smells like a loose u.FL.
+- **CAN-bus GNSS from the car's nav unit is the chosen plan-B** — the only
+  genuinely *independent* source (car roof antenna + its own receiver). Deferred
+  until the external antenna is evaluated; if pursued, it needs (1) VCDS capture
+  of the nav-unit request/response CAN IDs and lat/lng/time DIDs + scaling, and
+  (2) a reachability spike confirming those DIDs are routable through the gateway
+  from the OBD port. Integration would follow the atomic `readGroup()` pattern
+  (§8) with a staleness gate so it only fills when the u-blox is stale; coordinates
+  need a dedicated scaled-`int32`→float decoder (the generic `udsDecodeU32_4b`
+  overflows float's exact-integer range for degrees × 1e7).
+- **Standby / `GNSS_ALWAYS_ON` tuning** is a cheap, independent win that removes
+  the cold-start amplifier regardless of the antenna outcome.
+
+### 16.1 After external antenna fitted — 2026-06-19
+
+> **Snapshot: 2026-06-19.** External u-blox antenna fitted (loose-laid, not yet
+> mounted/dressed) and the car driven for a long afternoon trip. Same comparison
+> method as above, but against Traccar's Postgres (`tc_positions`) rather than
+> the SD dump, since the device is back online and transmitting.
+
+**Dataset:** 36-hour window ending 2026-06-19 11:16 UTC, device `Allroad`
+(`uniqueid ABCD1234`), **17,307 rows** across 11 drive sessions — including a
+170-minute afternoon drive (session #10, 05:40–08:30 UTC = 15:40–18:30 AEST,
+9,882 rows) and a 94-minute return (session #11, 5,328 rows). OBD speed `10D`
+used as the independent motion reference as before.
+
+| Metric | Pre (internal antenna) | Post (external antenna) |
+|---|---|---|
+| Rows with **no fix**, overall | 39.9 % | **0.0 %** (0 / 17,307) |
+| Rows with **no fix**, while moving (OBD ≥ 5 km/h) | 35.7 % | **0.0 %** (0 / 13,949) |
+| Drives with zero fix end-to-end | 16 / 58 | **0 / 11** |
+| Satellite count (median) | mixed, often 0 | **12** |
+| Inter-row cadence — p50 / p90 / p99 | — | 0.98 s / 2.0 s / 4.5 s |
+
+**Conclusion — the external antenna resolves the GNSS reliability issue.** The
+bimodal "solid lock or total silence" failure has not occurred in any session in
+this window; every moving sample carried a valid fix. Position track over the
+afternoon drive spans ~59 km N–S and 1.6° of longitude with GPS speed tracking
+OBD speed cleanly (e.g. 110 km/h GPS vs 110 km/h OBD on the freeway leg).
+
+**Caveats noted but not blocking:**
+
+- `hdop` reports `255` on a handful of rows — sentinel for "no DOP available yet"
+  while `valid=true` from a cached fix. Median hdop is 5 (i.e. 0.5 once the
+  ×10 wire scaling is reversed, §9).
+- `sat` outliers (min 1 during warm-up, max 59) suggest the new module is
+  reporting combined GNSS-system count in a single field; doesn't affect
+  position quality.
+- Antenna is **not yet permanently mounted** — wire run still needs to be hidden
+  and the puck fixed down. Re-confirm after mounting to make sure the cable
+  dressing doesn't introduce a connector flex problem.
+- **Plan-B (CAN-bus nav GNSS)** is therefore parked, not abandoned. No further
+  VCDS / gateway spike needed unless the external antenna regresses after
+  mounting.
+
+---
+
+## 17. Build & Flash
 
 PlatformIO:
 
@@ -436,7 +546,7 @@ without resetting.
 
 ---
 
-## 17. Known Warnings (non-fatal)
+## 18. Known Warnings (non-fatal)
 
 Appear every build, from transitively-included ESP-IDF headers; ignore:
 
@@ -450,7 +560,7 @@ link-up.
 
 ---
 
-## 18. Non-Goals / Out of Scope
+## 19. Non-Goals / Out of Scope
 
 - **No UDS writes** (0x2E), **no SecurityAccess** (0x27), **no UDS DTC** (0x19) —
   read-only; OBD-II Mode 0x03 DTCs suffice.
@@ -464,7 +574,7 @@ link-up.
 
 ---
 
-## 19. References
+## 20. References
 
 - ISO 14229-1 (UDS services), ISO 15765-2 (ISO-TP), ISO 11898 (CAN).
 - Vehicle: Audi A6 Allroad 3.0 TDI, EA897 evo, ECU `4G2 907 311 B`

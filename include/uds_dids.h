@@ -47,6 +47,14 @@
 // See SPDD.md §8 (The Derived-Inputs Group).
 #define UDS_GROUP    0
 
+// Synthetic PID — GPS-derived absolute capture time (Unix epoch seconds).
+// Emitted by process() alongside the existing PID_TIMESTAMP (millis) whenever
+// the GPS has a valid date/time. Survives reboot, so spooled packets replayed
+// in a later session still resolve to the moment they were captured. Sits
+// outside both the OBD `| 0x100` range (0x101..0x1FF) and the UDS synthetic
+// block (0x200+). See SPDD.md / [[spool-backfill-design]].
+#define PID_ABS_TIME                0x300
+
 // Synthetic PIDs — Phase 4 baseline (0x200..0x209)
 #define PID_UDS_COOLANT_TEMP        0x200
 #define PID_UDS_EGT_B1S1            0x201

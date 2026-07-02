@@ -95,9 +95,6 @@ uint32_t lastStatsTime = 0;
 int32_t syncInterval = SERVER_SYNC_INTERVAL * 1000;
 int32_t dataInterval = 1000;
 
-int fileid = 0;
-uint16_t lastSizeKB = 0;
-
 byte ledMode = 0;
 
 // Set by processOBD() each cycle: true when this cycle's RPM read succeeded.
@@ -134,7 +131,7 @@ CUDS uds;
 
 MEMS_I2C* mems = 0;
 
-SDLogger logger;
+RecordSpool spool;
 
 TeleClientUDP teleClient;
 
@@ -356,6 +353,21 @@ void processUDS(CBuffer* buffer)
   }
 }
 
+// Convert a UTC civil date/time to Unix epoch seconds without leaning on
+// mktime / TZ, which would otherwise interpret the GPS broadcast through
+// whatever local timezone the ESP32 happens to have configured. Algorithm:
+// Howard Hinnant's days_from_civil. Years/months are signed for the era math.
+static uint32_t gpsCivilToEpoch(int y, int m, int d, int h, int mi, int s)
+{
+  y -= (m <= 2);
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days = (long)era * 146097L + (long)doe - 719468L;
+  return (uint32_t)(days * 86400L + h * 3600 + mi * 60 + s);
+}
+
 bool initGPS()
 {
   if (sys.gpsBeginExt()) {
@@ -428,6 +440,18 @@ bool processGPS(CBuffer* buffer)
     buffer->add(PID_GPS_HEADING, ELEMENT_UINT16, &gd->heading, sizeof(uint16_t));
     if (gd->sat) buffer->add(PID_GPS_SAT_COUNT, ELEMENT_UINT8, &gd->sat, sizeof(uint8_t));
     if (gd->hdop) buffer->add(PID_GPS_HDOP, ELEMENT_UINT8, &gd->hdop, sizeof(uint8_t));
+    if (gd->date) {
+      // Bake the absolute capture time into the packet so spool replay across
+      // reboots resolves to the original moment, not the next session's anchor.
+      uint32_t epoch = gpsCivilToEpoch(
+        2000 + (int)(gd->date % 100),
+        (int)((gd->date / 100) % 100),
+        (int)(gd->date / 10000),
+        (int)(gd->time / 1000000),
+        (int)((gd->time % 1000000) / 10000),
+        (int)((gd->time % 10000) / 100));
+      buffer->add(PID_ABS_TIME, ELEMENT_UINT32, &epoch, sizeof(epoch));
+    }
   }
 
   Serial.print("[GNSS] ");
@@ -560,12 +584,9 @@ void initialize()
   }
 
   if (!state.check(STATE_STORAGE_READY)) {
-    if (logger.init()) {
+    if (spool.init()) {
       state.set(STATE_STORAGE_READY);
     }
-  }
-  if (state.check(STATE_STORAGE_READY)) {
-    fileid = logger.begin();
   }
 
   if (state.check(STATE_OBD_READY)) {
@@ -712,18 +733,6 @@ void process()
     lastStatsTime = startTime;
   }
 
-  if (state.check(STATE_STORAGE_READY)) {
-    buffer->serialize(logger);
-    uint16_t sizeKB = (uint16_t)(logger.size() >> 10);
-    if (sizeKB != lastSizeKB) {
-      logger.flush();
-      lastSizeKB = sizeKB;
-      Serial.print("[FILE] ");
-      Serial.print(sizeKB);
-      Serial.println("KB");
-    }
-  }
-
   const int dataIntervals[] = DATA_INTERVAL_TABLE;
   const uint16_t stationaryTime[] = STATIONARY_TIME_TABLE;
   unsigned int motionless = (millis() - lastMotionTime) / 1000;
@@ -803,6 +812,27 @@ bool initCell(bool quick = false)
 }
 
 /*******************************************************************************
+  Serializing queued live buffers into the SD spool
+
+  Called whenever the cell link is unusable (mid-drive outage or the back-off
+  between reconnect attempts) so records survive on SD instead of rotating out
+  of the RAM buffers. Oldest-first keeps the spool file chronological.
+*******************************************************************************/
+void spoolQueuedBuffers(CStorageRAM& store)
+{
+  CBuffer* buffer;
+  while ((buffer = bufman.getOldest())) {
+    store.header(devid);
+    store.timestamp(buffer->timestamp);
+    buffer->serialize(store);
+    bufman.free(buffer);
+    store.tailer();
+    spool.append(store.buffer(), store.length());
+    store.purge();
+  }
+}
+
+/*******************************************************************************
   Initializing network, maintaining connection and doing transmissions
 *******************************************************************************/
 void telemetry(void* inst)
@@ -826,6 +856,10 @@ void telemetry(void* inst)
       }
       state.clear(STATE_NET_READY | STATE_CELL_CONNECTED);
       teleClient.reset();
+      // Close any in-progress spool file so its FAT directory entry is
+      // committed before the device restarts on wake. Orphan files are
+      // re-discovered by spool.init() on next boot.
+      spool.closeForStandby();
       bufman.purge();
 
       uint32_t t = millis();
@@ -846,12 +880,19 @@ void telemetry(void* inst)
     while (state.check(STATE_WORKING)) {
       if (!state.check(STATE_CELL_CONNECTED)) {
         connErrors = 0;
+        // Records queued up since the link dropped (or since boot) go to the
+        // spool now, before the blocking connect attempt below.
+        spoolQueuedBuffers(store);
         if (!initCell() || !teleClient.connect()) {
           teleClient.cell.end();
           state.clear(STATE_NET_READY | STATE_CELL_CONNECTED);
           Serial.println("[CELL] Deactivated");
           // avoid turning on/off cellular module too frequently to avoid operator banning
-          delay(60000 * 3);
+          uint32_t t = millis();
+          do {
+            spoolQueuedBuffers(store);
+            delay(1000);
+          } while (state.check(STATE_WORKING) && millis() - t < 60000 * 3);
           break;
         }
         Serial.println("[CELL] In service");
@@ -871,7 +912,16 @@ void telemetry(void* inst)
 
       CBuffer* buffer = bufman.getNewest();
       if (!buffer) {
-        delay(50);
+        // Live producer is idle. Use the gap to drain one spooled record —
+        // older outages bleed back to the server in the background while the
+        // 1 Hz live path keeps first refusal on the cell. ~10 records/s when
+        // the live producer is fully idle, naturally interleaved with live
+        // transmits when it isn't.
+        if (spool.drainOneRecord(teleClient)) {
+          delay(100);
+        } else {
+          delay(50);
+        }
         continue;
       }
       store.header(devid);
@@ -884,11 +934,15 @@ void telemetry(void* inst)
 
       if (teleClient.transmit(store.buffer(), store.length())) {
         connErrors = 0;
+        // The link is good again — close any open outage file so the drain
+        // path picks it up on the next idle gap (no-op when none is open).
+        spool.endOutage();
         showStats();
       } else {
         timeoutsNet++;
         connErrors++;
         printTimeoutStats();
+        spool.append(store.buffer(), store.length());
         if (connErrors < MAX_CONN_ERRORS_RECONNECT) {
           teleClient.connect(true);
         }
@@ -934,9 +988,8 @@ void telemetry(void* inst)
 void standby()
 {
   state.set(STATE_STANDBY);
-  if (state.check(STATE_STORAGE_READY)) {
-    logger.end();
-  }
+  // The telemetry task observes STATE_STANDBY and flushes/closes its spool
+  // handles itself (see telemetry()); nothing to do here for storage.
 
 #if !GNSS_ALWAYS_ON && GNSS == GNSS_STANDALONE
   if (state.check(STATE_GPS_READY)) {

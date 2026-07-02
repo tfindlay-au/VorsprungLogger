@@ -1,9 +1,9 @@
+#ifndef TELESTORE_H_INCLUDED
+#define TELESTORE_H_INCLUDED
+
 #include <SPI.h>
 #include <FS.h>
 #include <SD.h>
-#include <SPIFFS.h>
-
-class CStorage;
 
 class CStorage {
 public:
@@ -54,41 +54,44 @@ protected:
     char* m_cache = 0;
 };
 
-class FileLogger : public CStorage {
-public:
-    FileLogger() { m_delimiter = ','; }
-    virtual void dispatch(const char* buf, byte len);
-    virtual uint32_t size() { return m_size; }
-    virtual void end()
-    {
-        m_file.close();
-        m_id = 0;
-        m_size = 0;
-    }
-    virtual void flush()
-    {
-        m_file.flush();
-    }
-protected:
-    int getFileID(File& root);
-    uint32_t m_dataTime = 0;
-    uint32_t m_dataCount = 0;
-    uint32_t m_size = 0;
-    uint32_t m_id = 0;
-    File m_file;
-};
+// Forward declaration to avoid pulling teleclient.h into the header.
+class TeleClientUDP;
 
-class SDLogger : public FileLogger {
+// Per-outage spool of unsent UDP packets on the SD card.
+//
+// On a failed transmit the telemetry task hands the encoded packet to
+// append(): records are length-prefixed binary blobs (2-byte big-endian
+// length, then the exact bytes that would have gone on the wire) and live
+// in /SPOOL/<seq>.PKT, one file per outage. endOutage() closes the active
+// file on the first successful transmit afterwards; drainOneRecord() then
+// walks the oldest file forward, re-sending records throttled by the
+// caller until the file is empty and unlinks it.
+//
+// Files-in-/SPOOL/ are the only state — no NVS, no high-water mark. A
+// crashed mid-drain leaves the file in place so the next attempt replays
+// it from byte zero. Some records arrive at the server twice; Traccar
+// accepts the duplicates (no unique constraint on (deviceid, devicetime)).
+class RecordSpool {
 public:
     bool init();
-    uint32_t begin();
-    void flush();
-};
+    bool append(const char* data, uint16_t len);
+    void endOutage();          // close active outage file (drain picks it up)
+    void closeForStandby();    // flush+close everything before reboot
+    bool hasFilesToDrain();    // any spool files awaiting drain
+    bool drainOneRecord(TeleClientUDP& tc);
 
-class SPIFFSLogger : public FileLogger {
-public:
-    bool init();
-    uint32_t begin();
 private:
-    void purge();
+    bool openOutageFile();
+    bool openNextDrainFile();
+    int  findOldestSeq(uint32_t excludeSeq);
+    void dropDrainFile(const char* reason);
+
+    File m_outage;
+    File m_drain;
+    uint32_t m_outageSeq = 0;
+    uint32_t m_drainSeq = 0;
+    uint32_t m_nextSeq = 1;
+    uint32_t m_appendCount = 0;
 };
+
+#endif // TELESTORE_H_INCLUDED

@@ -432,15 +432,15 @@ bool processGPS(CBuffer* buffer)
   if (kph >= 2) lastMotionTime = millis();
 
   if (buffer) {
-    buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &gd->time, sizeof(uint32_t));
-    buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
-    buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
-    buffer->add(PID_GPS_ALTITUDE, ELEMENT_FLOAT_D1, &gd->alt, sizeof(float)); /* m */
-    buffer->add(PID_GPS_SPEED, ELEMENT_FLOAT_D1, &kph, sizeof(kph));
-    buffer->add(PID_GPS_HEADING, ELEMENT_UINT16, &gd->heading, sizeof(uint16_t));
-    if (gd->sat) buffer->add(PID_GPS_SAT_COUNT, ELEMENT_UINT8, &gd->sat, sizeof(uint8_t));
-    if (gd->hdop) buffer->add(PID_GPS_HDOP, ELEMENT_UINT8, &gd->hdop, sizeof(uint8_t));
     if (gd->date) {
+      // Time PIDs only ride along with a valid GPS date. Traccar rebuilds
+      // devicetime from the time PID plus the date PID; without the date it
+      // stamps the packet with the server's current date, which mis-dates any
+      // spool replay that crosses UTC midnight. A time without a date isn't
+      // trustworthy anyway - leave both off and let the server use receive
+      // time for the (live) packet.
+      buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &gd->time, sizeof(uint32_t));
+      buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &gd->date, sizeof(uint32_t));
       // Bake the absolute capture time into the packet so spool replay across
       // reboots resolves to the original moment, not the next session's anchor.
       uint32_t epoch = gpsCivilToEpoch(
@@ -452,6 +452,13 @@ bool processGPS(CBuffer* buffer)
         (int)((gd->time % 10000) / 100));
       buffer->add(PID_ABS_TIME, ELEMENT_UINT32, &epoch, sizeof(epoch));
     }
+    buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
+    buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
+    buffer->add(PID_GPS_ALTITUDE, ELEMENT_FLOAT_D1, &gd->alt, sizeof(float)); /* m */
+    buffer->add(PID_GPS_SPEED, ELEMENT_FLOAT_D1, &kph, sizeof(kph));
+    buffer->add(PID_GPS_HEADING, ELEMENT_UINT16, &gd->heading, sizeof(uint16_t));
+    if (gd->sat) buffer->add(PID_GPS_SAT_COUNT, ELEMENT_UINT8, &gd->sat, sizeof(uint8_t));
+    if (gd->hdop) buffer->add(PID_GPS_HDOP, ELEMENT_UINT8, &gd->hdop, sizeof(uint8_t));
   }
 
   Serial.print("[GNSS] ");
@@ -1035,7 +1042,8 @@ void genDeviceID(char* buf)
 
 void showSysInfo()
 {
-  Serial.println("VorsprungLogger - Audi telemetry logger");
+  Serial.println("VorsprungLogger " FIRMWARE_VERSION " - Audi telemetry logger");
+  Serial.println("Build: " __DATE__ " " __TIME__);
   Serial.print("CPU:");
   Serial.print(ESP.getCpuFreqMHz());
   Serial.print("MHz FLASH:");
@@ -1085,7 +1093,10 @@ void setup()
     loadConfig();
   }
 
-  Serial.begin(115200);
+  // 38400 to match the external GNSS module: the module's NMEA output shares
+  // UART0's receive channel (see gpsBeginExt), and one UART runs one baud
+  // for both directions. Update monitor_speed in platformio.ini in lockstep.
+  Serial.begin(38400);
 
 #ifdef PIN_LED
   pinMode(PIN_LED, OUTPUT);

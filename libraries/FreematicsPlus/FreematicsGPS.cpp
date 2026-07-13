@@ -43,6 +43,7 @@ TinyGPS::TinyGPS()
   ,  _term_number(0)
   ,  _term_offset(0)
   ,  _gps_data_good(false)
+  ,  _sentence_malformed(false)
 #ifndef _GPS_NO_STATS
   ,  _good_sentences(0)
   ,  _failed_checksum(0)
@@ -82,6 +83,7 @@ bool TinyGPS::encode(char c)
     _sentence_type = _GPS_SENTENCE_OTHER;
     _is_checksum_term = false;
     _gps_data_good = false;
+    _sentence_malformed = false;
     return valid_sentence;
   }
 
@@ -175,6 +177,20 @@ unsigned long TinyGPS::parse_degrees()
   return (left / 100) * 1000000 + tenk_minutes / 6;
 }
 
+// A corrupted character inside a time or date term is silently truncated by
+// atol/parse_decimal (both stop at the first non-digit), which can turn
+// 215743.00 into 00:21:57 and forge near-midnight timestamps downstream.
+// NMEA time is hhmmss[.cc] and date is ddmmyy: require exactly 6 leading
+// digits followed by end-of-term (or a fraction where one is allowed), and
+// reject the whole sentence otherwise.
+static bool valid_datetime_term(const char* t, bool fraction_allowed)
+{
+  for (int i = 0; i < 6; i++)
+    if (!isdigit((unsigned char)t[i])) return false;
+  if (t[6] == 0) return true;
+  return fraction_allowed && t[6] == '.';
+}
+
 #define COMBINE(sentence_type, term_number) (((unsigned)(sentence_type) << 5) | term_number)
 
 // Processes a just-completed term
@@ -184,7 +200,7 @@ bool TinyGPS::term_complete()
   if (_is_checksum_term)
   {
     byte checksum = hex2uint8(_term);
-    if (checksum == _parity)
+    if (checksum == _parity && !_sentence_malformed)
     {
 #ifndef _GPS_NO_STATS
       ++_good_sentences;
@@ -242,8 +258,11 @@ bool TinyGPS::term_complete()
   {
     case COMBINE(_GPS_SENTENCE_GPRMC, 1): // Time in both sentences
     case COMBINE(_GPS_SENTENCE_GPGGA, 1):
-      _new_time = parse_decimal();
-      _new_time_fix = millis();
+      if (valid_datetime_term(_term, true)) {
+        _new_time = parse_decimal();
+        _new_time_fix = millis();
+      } else
+        _sentence_malformed = true;
       break;
     case COMBINE(_GPS_SENTENCE_GPRMC, 2): // GPRMC validity
       _gps_data_good = _term[0] == 'A';
@@ -274,7 +293,10 @@ bool TinyGPS::term_complete()
       _new_course = parse_decimal();
       break;
     case COMBINE(_GPS_SENTENCE_GPRMC, 9): // Date (GPRMC)
-      _new_date = atol(_term);
+      if (valid_datetime_term(_term, false))
+        _new_date = atol(_term);
+      else
+        _sentence_malformed = true;
       break;
     case COMBINE(_GPS_SENTENCE_GPGGA, 6): // Fix data (GPGGA)
       _gps_data_good = _term[0] > '0';

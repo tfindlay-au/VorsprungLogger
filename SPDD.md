@@ -525,6 +525,82 @@ OBD speed cleanly (e.g. 110 km/h GPS vs 110 km/h OBD on the freeway leg).
   VCDS / gateway spike needed unless the external antenna regresses after
   mounting.
 
+### 16.2 Post-v1.1.0 field check — 2026-07-13
+
+> **Snapshot: 2026-07-13.** First field data review since the v1.1.0 flash
+> (2026-07-11: hardened NMEA parser, date PID, external GPS on UART0 RX).
+> Same Postgres method as §16.1. Window: everything since the flash —
+> **25,961 rows** over ~60 h, 11 drive sessions.
+
+**Verified good:**
+
+- **Phantom-midnight corruption has not recurred.** No `.000`-ms phantom rows,
+  no corrupt `io768` dates. Heartbeats and a drive segment cross UTC midnight
+  cleanly. The §16-era parser fix is holding in the field.
+- **Transport is healthy.** Inter-row cadence p50 0.87 s / p99 5.2 s. One real
+  cellular outage in the whole window (2026-07-12 03:27:49→03:28:51 UTC, 63 s at
+  ~100 km/h): RAM-buffered rows replayed with correct devicetimes (servertime
+  lag draining 126 s → 4 s), confirming the §14 spool/replay path works at the
+  transport level. The 63 s hole itself contains no rows — consistent with the
+  blocking modem reconnect stalling record production (known design tradeoff,
+  acceptable).
+
+**Finding A — records without GPS payload carry no timestamp; spool drains
+mis-date them.** `processGPS()` gates PID `0x10`/`0x11`/`PID_ABS_TIME` on
+`gd->date`, so a record built between GPS updates has *no time information at
+all* and Traccar stamps it with **arrival time**. Exact partition confirmed:
+the 4,399 rows (17 %) with servertime ≡ devicetime are precisely the rows
+lacking `sat`/`io768`. Live this is harmless (<1 s error); on spool drain each
+GPS-less record lands at *drain* time, not capture time. Observed damage:
+
+- Old idle-engine content (OBD 0–4 km/h, rpm ~780, 12.0 V battery) interleaved
+  into a live 85 km/h stream at reconnect (7/12 03:20:30, 7/11 04:42:30) —
+  wrong time *and* wrong position (Traccar copies the last live location onto
+  timestampless packets).
+- A **phantom 1-minute "session"** at 2026-07-12 00:02:54: 281 rows in 60 s
+  (4.7 rows/s — faster than live production), 0 % GPS payload, moving-OBD
+  content from an earlier capture, all collapsed onto the drain moment.
+- Server-side `totalDistance` corrupted by the out-of-order arrivals
+  (kilometre-scale backwards jumps around every drain).
+
+**Finding B — a real ~25-min GNSS payload blackout on 2026-07-13, masked by
+the fix metric.** Drive 06:22–06:51 UTC (real drive; OBD shows the full
+accelerate/decelerate/park profile): GPS payload in only **3.6 %** of records —
+nothing at all 06:22:52→06:37:39 and again 06:39:49→06:49:40. Track frozen at
+three coordinates. `stats` still reported **100 % fix** because Traccar carries
+the last known position forward and marks it `valid`. Healthy sessions run
+72–97 % GPS payload. First blackout since the antenna install; it sits on the
+new UART0 RX path. Recovered on its own (next drive 87 %). Cause unknown —
+needs a serial capture (does `[GNSS]` output stop, or does data flow but fail
+the stale/jump checks?).
+
+**Proposed fixes — PENDING, not yet implemented.** Plan: collect more drive
+data through the week, re-analyse ~2026-07-16 (Thu); if the diagnosis stands
+up, implement + flash then.
+
+1. **Timestamp every record** (fixes Finding A). Bake a device-side epoch into
+   every serialized record, not just GPS-carrying ones: hold a time anchor
+   (last GPS epoch, else network/LOGIN time) plus a `millis()` delta at record
+   build. `PID_ABS_TIME` exists precisely for this; emit it unconditionally
+   once any anchor is known. GPS `0x10`/`0x11` stay gated on `gd->date` as
+   now. Requires Traccar to honour it — the server decoder maps `0x300` to
+   attribute `io768` only, so either (a) also emit `0x10`/`0x11` derived from
+   the anchor epoch, which the stock decoder already turns into devicetime, or
+   (b) patch the server decoder. Option (a) is firmware-only and preferred.
+2. **Make the baseline script measure real GNSS availability** (exposes
+   Finding B instead of masking it). `traccar_baseline.py` must count GPS
+   payload presence (`sat`/`io768` in attributes), not Traccar `valid`; report
+   per-session payload %, and flag zero-lag row bursts (drain signatures).
+   This was already a §16 TODO; Finding B upgrades it to required.
+3. **Instrument the GNSS path for the blackout** (diagnoses Finding B).
+   Serial capture on a real drive; if not reproducible on demand, add a
+   lightweight counter PID (NMEA sentences seen / checksum failures /
+   stale-jump rejections per minute) so the next blackout self-diagnoses from
+   the Traccar side.
+4. *(Optional, lower priority)* Consider draining spool records oldest-first
+   only while a monotonic guard holds, or tagging drained packets, so any
+   future timestampless stragglers can't forge phantom sessions.
+
 ---
 
 ## 17. Build & Flash

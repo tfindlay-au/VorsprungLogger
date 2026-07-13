@@ -77,7 +77,6 @@ extern "C" {
 
 #define FLAG_USE_CELL 0x2
 #define FLAG_USE_UART_LINK 0x4
-#define FLAG_GNSS_SOFT_SERIAL 0x8
 #define FLAG_GNSS_USE_LINK 0x10
 
 int readChipTemperature();

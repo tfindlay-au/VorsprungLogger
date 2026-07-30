@@ -20,6 +20,7 @@
 #include <FreematicsPlus.h>
 #include "telestore.h"
 #include "teleclient.h"
+#include "timeanchor.h"
 #include "config.h"
 
 extern int16_t rssi;
@@ -51,6 +52,7 @@ void CBuffer::add(uint16_t pid, uint8_t type, void* values, int bytes, uint8_t c
 void CBuffer::purge()
 {
   state = BUFFER_STATE_EMPTY;
+  tick = 0;
   timestamp = 0;
   offset = 0;
   total = 0;
@@ -203,6 +205,28 @@ void CBufferManager::printStats()
   }
 }
 
+bool CellUDPTime::networkTime(uint32_t& utcSec)
+{
+  // +CCLK: "yy/MM/dd,hh:mm:ss+zz" — zz is the local zone's offset from GMT in
+  // quarter-hours, so subtracting it yields true UTC. A modem that never saw
+  // NITZ answers with its 1980 power-on default; timeAnchorSet() floors that.
+  if (!sendCommand("AT+CCLK?\r")) return false;
+  char* p = strstr(getBuffer(), "+CCLK:");
+  if (!p) return false;
+  p = strchr(p, '"');
+  if (!p) return false;
+
+  int yy, mo, dd, hh, mi, ss, tz = 0;
+  char sign = '+';
+  if (sscanf(p + 1, "%d/%d/%d,%d:%d:%d%c%d", &yy, &mo, &dd, &hh, &mi, &ss, &sign, &tz) < 6)
+    return false;
+
+  int32_t offset = (int32_t)tz * 15 * 60;
+  if (sign == '-') offset = -offset;
+  utcSec = (uint32_t)((int32_t)timeCivilToEpoch(2000 + yy, mo, dd, hh, mi, ss) - offset);
+  return true;
+}
+
 bool TeleClientUDP::verifyChecksum(char* data)
 {
   uint8_t sum = 0;
@@ -261,9 +285,10 @@ bool TeleClientUDP::notify(byte event, const char* payload)
     if (event == EVENT_LOGIN) {
       char *p = strstr(data, "TM=");
       if (p) {
-        unsigned long tm = atol(p + 3);
-        struct timeval tv = { .tv_sec = (time_t)tm, .tv_usec = 0 };
-        settimeofday(&tv, NULL);
+        // The server's own clock, one round-trip old. Coarser than GNSS but it
+        // arrives the moment the link comes up, which on a cold start is well
+        // before the first fix.
+        timeAnchorSet(TIME_SRC_NET, (uint32_t)atol(p + 3), timeTicks());
       }
       p = strstr(data, "SN=");
       if (p) {

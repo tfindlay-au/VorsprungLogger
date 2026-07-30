@@ -2,6 +2,7 @@
 #include "config.h"
 #include "telestore.h"
 #include "teleclient.h"
+#include "timeanchor.h"
 
 void CStorage::log(uint16_t pid, uint8_t values[], uint8_t count)
 {
@@ -121,6 +122,15 @@ void CStorageRAM::untailer()
     }
 }
 
+void CStorageRAM::load(const char* data, unsigned int len)
+{
+    if (len >= m_cacheSize) len = m_cacheSize - 1;
+    memcpy(m_cache, data, len);
+    m_cache[len] = 0;   // untailer() scans for '*', so the cache must be a string
+    m_cacheBytes = len;
+    m_samples = 0;
+}
+
 /*******************************************************************************
   RecordSpool — per-outage SD spool of unsent UDP packets.
 *******************************************************************************/
@@ -196,18 +206,37 @@ bool RecordSpool::openOutageFile()
     return true;
 }
 
-bool RecordSpool::append(const char* data, uint16_t len)
+bool RecordSpool::writeRecord(const uint8_t* prefix, uint8_t prefixLen, const char* data, uint16_t len)
 {
     if (len == 0) return true;
     if (!m_outage && !openOutageFile()) return false;
-    uint8_t hdr[2] = { (uint8_t)(len >> 8), (uint8_t)(len & 0xFF) };
+    uint16_t total = prefixLen + len;
+    uint8_t hdr[2] = { (uint8_t)(total >> 8), (uint8_t)(total & 0xFF) };
     if (m_outage.write(hdr, 2) != 2) return false;
+    if (prefixLen && m_outage.write(prefix, prefixLen) != (int)prefixLen) return false;
     if (m_outage.write((const uint8_t*)data, len) != (int)len) return false;
     m_appendCount++;
     // Periodic sync without close — bounds power-cut loss to ~30 records while
     // keeping the FAT directory entry honest for boot-time recovery.
     if ((m_appendCount % 30) == 0) m_outage.flush();
     return true;
+}
+
+bool RecordSpool::append(const char* data, uint16_t len)
+{
+    return writeRecord(0, 0, data, len);
+}
+
+bool RecordSpool::appendUnstamped(const char* data, uint16_t len, uint64_t tickUs)
+{
+    uint32_t bootId = timeBootId();
+    uint8_t prefix[SPOOL_STAMP_PREFIX] = {
+        SPOOL_MARK_UNSTAMPED,
+        (uint8_t)(bootId >> 24), (uint8_t)(bootId >> 16), (uint8_t)(bootId >> 8), (uint8_t)bootId,
+        (uint8_t)(tickUs >> 56), (uint8_t)(tickUs >> 48), (uint8_t)(tickUs >> 40), (uint8_t)(tickUs >> 32),
+        (uint8_t)(tickUs >> 24), (uint8_t)(tickUs >> 16), (uint8_t)(tickUs >> 8),  (uint8_t)tickUs,
+    };
+    return writeRecord(prefix, sizeof(prefix), data, len);
 }
 
 void RecordSpool::endOutage()
@@ -295,8 +324,13 @@ void RecordSpool::dropDrainFile(const char* reason)
     m_drainSeq = 0;
 }
 
-bool RecordSpool::drainOneRecord(TeleClientUDP& tc)
+bool RecordSpool::drainOneRecord(TeleClientUDP& tc, CStorageRAM& store)
 {
+    // Until something has told this device the time, draining can only spend
+    // records on server-arrival stamps — the exact defect the spool exists to
+    // avoid. Wait; the anchor lands within seconds of the link coming up.
+    if (!timeAnchorIsSet()) return false;
+
     if (!m_drain && !openNextDrainFile()) return false;
 
     // Reached end of file → unlink, look for the next file on the next call.
@@ -312,18 +346,52 @@ bool RecordSpool::drainOneRecord(TeleClientUDP& tc)
         return true;
     }
     uint16_t len = ((uint16_t)hdr[0] << 8) | hdr[1];
-    if (len == 0 || len > SERIALIZE_BUFFER_SIZE) {
+    if (len == 0 || len > SERIALIZE_BUFFER_SIZE + SPOOL_STAMP_PREFIX) {
         dropDrainFile("bad length");
         return true;
     }
 
-    char buf[SERIALIZE_BUFFER_SIZE];
+    char buf[SERIALIZE_BUFFER_SIZE + SPOOL_STAMP_PREFIX];
     if ((uint16_t)m_drain.read((uint8_t*)buf, len) != len) {
         dropDrainFile("short payload");
         return true;
     }
 
-    if (tc.transmit(buf, len)) {
+    const char* out = buf;
+    unsigned int outLen = len;
+
+    if (len > SPOOL_STAMP_PREFIX && buf[0] == SPOOL_MARK_UNSTAMPED) {
+        uint32_t bootId = ((uint32_t)(uint8_t)buf[1] << 24) | ((uint32_t)(uint8_t)buf[2] << 16)
+                        | ((uint32_t)(uint8_t)buf[3] << 8)  |  (uint32_t)(uint8_t)buf[4];
+        uint64_t tickUs = 0;
+        for (int i = 5; i < SPOOL_STAMP_PREFIX; i++) tickUs = (tickUs << 8) | (uint8_t)buf[i];
+
+        if (bootId != timeBootId()) {
+            // The tick is measured from a previous boot's monotonic clock, which
+            // nothing in this session can convert. Sending it anyway hands the
+            // server an untimed packet — precisely the mis-dating this scheme
+            // exists to prevent — so the record goes no further.
+            Serial.println("[SPOOL] stale-boot record dropped");
+            return true;
+        }
+        uint32_t utc;
+        if (!timeAnchorResolve(tickUs, utc)) {
+            // No anchor yet. Rewind and wait: these records are the whole reason
+            // the drain exists, and there is no point spending them untimed.
+            m_drain.seek(recordStart);
+            return false;
+        }
+        store.purge();
+        store.load(buf + SPOOL_STAMP_PREFIX, len - SPOOL_STAMP_PREFIX);
+        store.untailer();
+        timeWriteStamp(store, utc);
+        store.tailer();
+        out = store.buffer();
+        outLen = store.length();
+    }
+
+    if (tc.transmit(out, outLen)) {
+        store.purge();
         return true;
     }
 
@@ -335,5 +403,6 @@ bool RecordSpool::drainOneRecord(TeleClientUDP& tc)
     m_drain.seek(recordStart);
     m_drain.close();
     m_drainSeq = 0;
+    store.purge();
     return false;
 }

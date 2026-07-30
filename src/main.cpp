@@ -24,6 +24,7 @@
 #include "config.h"
 #include "telestore.h"
 #include "teleclient.h"
+#include "timeanchor.h"
 #include "uds_dids.h"
 #include "driver/adc.h"
 #include "nvs_flash.h"
@@ -353,21 +354,6 @@ void processUDS(CBuffer* buffer)
   }
 }
 
-// Convert a UTC civil date/time to Unix epoch seconds without leaning on
-// mktime / TZ, which would otherwise interpret the GPS broadcast through
-// whatever local timezone the ESP32 happens to have configured. Algorithm:
-// Howard Hinnant's days_from_civil. Years/months are signed for the era math.
-static uint32_t gpsCivilToEpoch(int y, int m, int d, int h, int mi, int s)
-{
-  y -= (m <= 2);
-  int era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  long days = (long)era * 146097L + (long)doe - 719468L;
-  return (uint32_t)(days * 86400L + h * 3600 + mi * 60 + s);
-}
-
 bool initGPS()
 {
   if (sys.gpsBeginExt()) {
@@ -412,6 +398,18 @@ bool processGPS(CBuffer* buffer)
     if (tenth) p += sprintf(p, ".%c00", '0' + tenth);
     *p = 'Z';
     *(p + 1) = 0;
+
+    // Feed the shared anchor rather than stamping this packet directly. Doing
+    // it here — above the position checks — means a time-only fix still dates
+    // every record in the session, and every record gets the same treatment
+    // whether or not GNSS happened to have a position for it.
+    timeAnchorSet(TIME_SRC_GPS, timeCivilToEpoch(
+        2000 + (int)(gd->date % 100),
+        (int)((gd->date / 100) % 100),
+        (int)(gd->date / 10000),
+        (int)(gd->time / 1000000),
+        (int)((gd->time % 1000000) / 10000),
+        (int)((gd->time % 10000) / 100)), timeTicks());
   }
   if (gd->lng == 0 && gd->lat == 0) {
     if (gd->date) {
@@ -432,26 +430,8 @@ bool processGPS(CBuffer* buffer)
   if (kph >= 2) lastMotionTime = millis();
 
   if (buffer) {
-    if (gd->date) {
-      // Time PIDs only ride along with a valid GPS date. Traccar rebuilds
-      // devicetime from the time PID plus the date PID; without the date it
-      // stamps the packet with the server's current date, which mis-dates any
-      // spool replay that crosses UTC midnight. A time without a date isn't
-      // trustworthy anyway - leave both off and let the server use receive
-      // time for the (live) packet.
-      buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &gd->time, sizeof(uint32_t));
-      buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &gd->date, sizeof(uint32_t));
-      // Bake the absolute capture time into the packet so spool replay across
-      // reboots resolves to the original moment, not the next session's anchor.
-      uint32_t epoch = gpsCivilToEpoch(
-        2000 + (int)(gd->date % 100),
-        (int)((gd->date / 100) % 100),
-        (int)(gd->date / 10000),
-        (int)(gd->time / 1000000),
-        (int)((gd->time % 1000000) / 10000),
-        (int)((gd->time % 10000) / 100));
-      buffer->add(PID_ABS_TIME, ELEMENT_UINT32, &epoch, sizeof(epoch));
-    }
+    // No time PIDs here — the anchor above owns them now, and buildPacket()
+    // writes them into every packet at serialization time.
     buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
     buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
     buffer->add(PID_GPS_ALTITUDE, ELEMENT_FLOAT_D1, &gd->alt, sizeof(float)); /* m */
@@ -674,9 +654,13 @@ void process()
 {
   static uint32_t lastGPStick = 0;
   uint32_t startTime = millis();
+  // Taken once, at the top of the cycle: this is the record's capture instant,
+  // and everything downstream dates the record from it.
+  uint64_t tick = timeTicks();
 
   CBuffer* buffer = bufman.getFree();
   buffer->state = BUFFER_STATE_FILLING;
+  buffer->tick = tick;
 
   if (state.check(STATE_OBD_READY)) {
     processOBD(buffer);
@@ -732,7 +716,7 @@ void process()
   }
   buffer->add(PID_DEVICE_TEMP, ELEMENT_INT32, &deviceTemp, sizeof(deviceTemp));
 
-  buffer->timestamp = millis();
+  buffer->timestamp = (uint32_t)(tick / 1000);
   buffer->state = BUFFER_STATE_FILLED;
 
   if (startTime - lastStatsTime >= 3000) {
@@ -791,6 +775,14 @@ bool initCell(bool quick = false)
       Serial.println(netop);
     }
 
+    // Registration is done, so the network has handed the modem its clock.
+    // This is the earliest time source on a cold start and the only one that
+    // works underground — take it before the server is even contacted.
+    uint32_t netTime;
+    if (teleClient.cell.networkTime(netTime)) {
+      timeAnchorSet(TIME_SRC_NET, netTime, timeTicks());
+    }
+
 #if GNSS == GNSS_CELLULAR
     if (teleClient.cell.setGPS(true)) {
       Serial.println("CELL GNSS:OK");
@@ -819,6 +811,31 @@ bool initCell(bool quick = false)
 }
 
 /*******************************************************************************
+  Turning one filled buffer into a wire packet
+
+  Every packet carries absolute UTC time, not just the ones that happened to
+  land on a GNSS update. The time comes from the record's own capture tick
+  resolved against the shared anchor, so a record built with no GPS payload is
+  filed at the moment it was captured rather than the moment it arrived — which
+  is what turned each spool drain into a phantom session (SPDD §16.2 Finding A).
+
+  Returns false when no anchor exists yet, i.e. nothing has told this device the
+  time since boot. The caller must then spool the record unstamped so the drain
+  can back-stamp it once a source turns up.
+*******************************************************************************/
+bool buildPacket(CStorageRAM& store, CBuffer* buffer)
+{
+  store.header(devid);
+  store.timestamp(buffer->timestamp);
+  buffer->serialize(store);
+  uint32_t utc;
+  bool stamped = timeAnchorResolve(buffer->tick, utc);
+  if (stamped) timeWriteStamp(store, utc);
+  store.tailer();
+  return stamped;
+}
+
+/*******************************************************************************
   Serializing queued live buffers into the SD spool
 
   Called whenever the cell link is unusable (mid-drive outage or the back-off
@@ -829,12 +846,13 @@ void spoolQueuedBuffers(CStorageRAM& store)
 {
   CBuffer* buffer;
   while ((buffer = bufman.getOldest())) {
-    store.header(devid);
-    store.timestamp(buffer->timestamp);
-    buffer->serialize(store);
+    uint64_t tick = buffer->tick;
+    bool stamped = buildPacket(store, buffer);
     bufman.free(buffer);
-    store.tailer();
-    spool.append(store.buffer(), store.length());
+    if (stamped)
+      spool.append(store.buffer(), store.length());
+    else
+      spool.appendUnstamped(store.buffer(), store.length(), tick);
     store.purge();
   }
 }
@@ -924,18 +942,16 @@ void telemetry(void* inst)
         // 1 Hz live path keeps first refusal on the cell. ~10 records/s when
         // the live producer is fully idle, naturally interleaved with live
         // transmits when it isn't.
-        if (spool.drainOneRecord(teleClient)) {
+        if (spool.drainOneRecord(teleClient, store)) {
           delay(100);
         } else {
           delay(50);
         }
         continue;
       }
-      store.header(devid);
-      store.timestamp(buffer->timestamp);
-      buffer->serialize(store);
+      uint64_t tick = buffer->tick;
+      bool stamped = buildPacket(store, buffer);
       bufman.free(buffer);
-      store.tailer();
       Serial.print("[DAT] ");
       Serial.println(store.buffer());
 
@@ -949,7 +965,10 @@ void telemetry(void* inst)
         timeoutsNet++;
         connErrors++;
         printTimeoutStats();
-        spool.append(store.buffer(), store.length());
+        if (stamped)
+          spool.append(store.buffer(), store.length());
+        else
+          spool.appendUnstamped(store.buffer(), store.length(), tick);
         if (connErrors < MAX_CONN_ERRORS_RECONNECT) {
           teleClient.connect(true);
         }
@@ -1104,6 +1123,7 @@ void setup()
 #endif
 
   genDeviceID(devid);
+  timeAnchorInit();
   showSysInfo();
 
   bufman.init();

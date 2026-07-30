@@ -3,10 +3,10 @@
 
 /**************************************
 * Firmware identity, printed at boot.
-* Bump the version when behaviour changes; the build timestamp printed
-* alongside it pins the exact binary either way.
+* Bump the version when behaviour changes and add an entry to CHANGELOG.md;
+* the build timestamp printed alongside it pins the exact binary either way.
 **************************************/
-#define FIRMWARE_VERSION "v1.1.0"
+#define FIRMWARE_VERSION "v1.2.0"
 
 /**************************************
 * Circular Buffer Configuration

@@ -34,6 +34,10 @@ public:
     void add(uint16_t pid, uint8_t type, void* values, int bytes, uint8_t count = 1);
     void purge();
     void serialize(CStorage& store);
+    // Monotonic microseconds at the capture instant. This — not `timestamp`,
+    // and not the moment the packet reaches the server — is what the record's
+    // UTC time is derived from. See timeanchor.h.
+    uint64_t tick;
     uint32_t timestamp;
     uint16_t offset;
     uint8_t total;
@@ -83,6 +87,16 @@ public:
     bool login = false;
 };
 
+// CellUDP plus the modem's own clock. The network hands out UTC (NITZ) at
+// registration, so this answers on a cold start in an underground car park
+// where GNSS will not lock and the telemetry server is not yet reachable —
+// the case that leaves records with no time at all (SPDD §16.2 Finding A).
+class CellUDPTime : public CellUDP
+{
+public:
+    bool networkTime(uint32_t& utcSec);
+};
+
 class TeleClientUDP : public TeleClient
 {
 public:
@@ -93,5 +107,5 @@ public:
     void inbound();
     bool verifyChecksum(char* data);
     void shutdown();
-    CellUDP cell;
+    CellUDPTime cell;
 };

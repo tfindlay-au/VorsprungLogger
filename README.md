@@ -19,8 +19,9 @@ UDS DIDs are polled by a tiered countdown scheduler (`UDS_FAST` / `UDS_SLOW` / `
 
 ## Storage & transmission
 
-* MicroSD card logging (CSV).
 * Telemetry over **cellular UDP** to a Traccar endpoint, framed as `devid#PID:value,...*checksum`.
+* On a cell outage, unsent packets spool to microSD (`/SPOOL/<seq>.PKT`, one file per outage) and drain back to the server on reconnect, so a dropout leaves no permanent gap. See [`SPDD.md`](SPDD.md) §14.
+* Every record carries its own capture time, derived from a monotonic tick plus a GNSS/cellular UTC anchor — so replayed records are filed at the moment they were captured, not the moment they arrived. See [`TIME.md`](TIME.md) and [`SPDD.md`](SPDD.md) §16.3.
 
 ## Hardware
 
@@ -38,6 +39,8 @@ pio run -e esp32dev -t upload  # flash
 ```
 
 The Freematics SDK lives under [`libraries/`](libraries) and is consumed as-is.
+
+Release history is in [`CHANGELOG.md`](CHANGELOG.md); the firmware version and build timestamp are printed at boot.
 
 ## Credits
 

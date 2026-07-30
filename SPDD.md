@@ -574,9 +574,22 @@ new UART0 RX path. Recovered on its own (next drive 87 %). Cause unknown —
 needs a serial capture (does `[GNSS]` output stop, or does data flow but fail
 the stale/jump checks?).
 
-**Proposed fixes — PENDING, not yet implemented.** Plan: collect more drive
-data through the week, re-analyse ~2026-07-16 (Thu); if the diagnosis stands
-up, implement + flash then.
+**Re-checked 2026-07-25 (12 days / 288 h, 41,199 rows, no code changes since
+this section was written).**
+
+- **Finding A has worsened, not stabilised.** `devicetime == servertime`
+  rows (the mis-dated GPS-less signature) rose from 17 % to **33 %** of all
+  rows. The phantom-session burst pattern recurs **roughly once a day**
+  (180–300 rows landing in the same arrival-minute: 7/16, 7/18–7/24), each
+  lining up with a morning/evening reconnect after a long parked gap. This is
+  a standing daily corruption, not a rare edge case — it should be
+  prioritised over further re-analysis.
+- **Finding B did not recur.** All 32 real drive sessions in the trailing 12
+  days held ≥ 20 % GPS payload; none came close to the 3.6 % seen on 7/13.
+  Treat it as a one-off on the new UART0 RX path, not a standing issue —
+  deprioritise relative to Finding A.
+
+**Proposed fixes — item 1 IMPLEMENTED (see §16.3); items 2–4 still pending.**
 
 1. **Timestamp every record** (fixes Finding A). Bake a device-side epoch into
    every serialized record, not just GPS-carrying ones: hold a time anchor
@@ -600,6 +613,122 @@ up, implement + flash then.
 4. *(Optional, lower priority)* Consider draining spool records oldest-first
    only while a monotonic guard holds, or tagging drained packets, so any
    future timestampless stragglers can't forge phantom sessions.
+
+**Fidelity required vs. fidelity available — what "fix the timestamp" actually
+means.** Item 1's anchor needs to be *good enough*, not perfect; worth stating
+the target and the candidate sources against it explicitly, since the gap
+between them is the crux of the remaining design decision:
+
+- **GPS, when locked:** sub-second UTC timestamp *and* lat/lng in the same
+  fix. This is the reference fidelity — every "good" row in Traccar has this.
+  The whole problem in Finding A is the subset of records built with **no
+  anchor at all** (not degraded fidelity — total absence), which is why they
+  fall back to Traccar's arrival-time stamp.
+- **Network/LOGIN time (existing fallback in item 1's plan):** roughly
+  second-level, UTC, but only available when there's cellular registration —
+  which is not guaranteed to hold exactly when a GPS-less record is being
+  built (both can be down together, e.g. underground/tunnel/parking
+  structure).
+- **Vehicle CAN/UDS clock** (candidate "Plan C", investigated separately —
+  see the sibling `can_sniffer` project, not detailed here): the car's
+  instrument-cluster ECU exposes a diagnostic time/date DID, whole-second
+  resolution, always reachable whenever the OBD link is up (battery-backed,
+  independent of cellular reg). Two fidelity gaps versus GPS that matter for
+  how it'd be used: (1) it's **local wall-clock with DST**, not UTC — needs a
+  timezone/DST correction before use as an anchor; (2) it carries **no
+  position** — wiring it in closes the "record has zero timestamp" defect
+  (Finding A's actual bug) but does *not* give GPS-less records a real
+  position; Traccar would still copy-forward the last known fix for those
+  rows, same as it already does for Finding B's masked blackout. It is also
+  itself GPS-sourced-with-holdover on this platform (confirmed via VCDS: no
+  CAN clock on the bus is independent of GPS), so it degrades gracefully
+  across short reception gaps rather than being a true independent source.
+- **Net:** for Finding A, second-level local-time-corrected-to-UTC is
+  sufficient fidelity — the bug being fixed is mis-ordering/mis-dating on
+  spool drain, not sub-second precision. Sub-second GPS-grade fidelity is
+  not required for the timestamp anchor itself, only for position, which no
+  candidate anchor here provides. So the CAN clock is a plausible fix for
+  the *timestamp* half of Finding A but does not address, and should not be
+  framed as addressing, the *position* half.
+
+### 16.3 Monotonic back-stamping — implemented 2026-07-29
+
+Fixes §16.2 Finding A. Design write-up in `TIME.md`; code in
+`timeanchor.{h,cpp}` plus the spool and packet-build paths.
+
+**The CAN clock (plan C) is dropped.** The fidelity analysis above already
+concluded it fixes only the timestamp half and is itself GPS-sourced with
+holdover; against that, Module 17 polling costs UDS/ISO-TP filter complexity,
+hardware debugging friction, and a local-time-with-DST correction. Nothing in
+this firmware ever targeted Module 17, so there was nothing to remove — the
+`can_sniffer` spike is simply not carried forward.
+
+**Capture tick.** Every record now takes `esp_timer_get_time()` once at the top
+of its `process()` cycle and carries it in `CBuffer::tick`. 64-bit monotonic
+microseconds: no 49-day `millis()` wrap, unaffected by `settimeofday()`.
+`buffer->timestamp` (PID `0x00`, and the buffer manager's ordering key) is now
+derived from that tick rather than an independent `millis()` call.
+
+**Tiered anchor.** One global pair — "at tick M the clock read T" — in
+`timeanchor.cpp`, guarded by a spinlock because the main loop writes it and the
+telemetry task reads it. Sources, by rank:
+
+| Rank | Source | Set from | Notes |
+|---|---|---|---|
+| 2 | `TIME_SRC_GPS` | `processGPS()`, on any valid `gd->date` | Sub-second. Now set **above** the position checks, so a time-only fix still anchors the session |
+| 1 | `TIME_SRC_NET` | `AT+CCLK?` after `cell.setup()`; Traccar login `TM=` | Second-level. Works underground, and lands before the first GNSS fix on a cold start |
+
+A higher rank always replaces a lower one; a lower rank waits until the
+incumbent is 120 s stale. Readings before 2025-01-01 are rejected, which
+catches an un-provisioned modem's 1980 default and mis-parsed NMEA dates.
+The first accepted reading of a session also sets the system clock, so SD
+directory entries and `printTime()` stay honest.
+
+**Stamping is single-sourced.** `processGPS()` no longer writes `0x10`/`0x11`/
+`0x300` into the buffer. `buildPacket()` resolves the record's tick against the
+anchor and writes all three at serialization time, for **every** packet — live
+or spooled, GPS payload or not. This is §16.2 item 1 option (a): Traccar's
+stock decoder rebuilds `devicetime` from the `0x10`/`0x11` pair, so no server
+change is needed. Conversion is hand-rolled (Hinnant civil/days) to keep the
+ESP32's configured timezone out of it; round-trip verified against `gmtime`
+over 316,483 samples spanning 2025–2035, zero mismatches.
+
+**Back-stamping across the pre-anchor window.** Records built before any source
+has reported cannot be stamped at build time, and on a cold start they are
+spooled before the modem is even up. Those go to SD via
+`appendUnstamped()`, which prefixes the record with a 13-byte header — marker
+`0x00`, boot ID, capture tick, big-endian. `drainOneRecord()` resolves the tick
+against the anchor and splices the time PIDs in on the way out
+(`CStorageRAM::load` → `untailer` → stamp → `tailer`), so the record lands at
+capture time, not drain time. Consequences worth knowing:
+
+- **Old spool files still drain.** A stamped record starts with the device ID,
+  always alphanumeric, so pre-existing `.PKT` files read back unambiguously.
+- **Ticks are only comparable within one boot**, hence the boot ID. A record
+  whose boot ID no longer matches is **dropped**, with a log line: its tick is
+  measured from a monotonic clock that no longer exists, and sending it
+  untimed would forge exactly the phantom session being eliminated. This only
+  affects records from a session that never obtained *any* time source before
+  reboot, and it also closes §16.2 item 4.
+- **Drain is gated on the anchor.** `drainOneRecord()` returns early while the
+  device has no clock rather than spending records on arrival stamps.
+
+**RTC-RAM holdover (TIME.md's optional tier 3) was not implemented.** Standby
+busy-waits on MEMS and then `ESP.restart()`s, so ticks reset while the park
+duration stays unknown — a carried-over anchor would be wrong by exactly the
+gap it was meant to bridge. The spool's boot ID handles the same case honestly
+instead.
+
+**What this does not fix.** The position half, unchanged and by design: a
+GPS-less record still has no coordinates, and Traccar still copies the last
+known fix onto it. Correct time now means those rows sort into the right place
+instead of collapsing onto the drain moment, but they remain
+position-by-inference. Finding B is untouched.
+
+**Field verification pending** — needs a flash, then a re-run of the §16.1
+Postgres method looking for: `devicetime == servertime` share falling from
+33 % toward ~0, no same-arrival-minute row bursts, and drained rows landing at
+plausible capture times.
 
 ---
 

@@ -3,9 +3,18 @@
 .pioenvs/
 .piolibdeps/
 
-# IDE
+# IDE / agent tooling — may capture local paths and credentials
 .vscode/
 .idea/
+.claude/
+
+# Deployment-specific: real endpoint lives here, secrets.h.example is tracked
+include/secrets.h
+
+# Local infrastructure — Home Assistant config and Postgres reporting schema.
+# Both carry internal hostnames and are specific to one deployment.
+homeassistant/
+sql/
 
 # Python (tools/)
 __pycache__/

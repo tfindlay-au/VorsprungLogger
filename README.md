@@ -34,9 +34,14 @@ UDS DIDs are polled by a tiered countdown scheduler (`UDS_FAST` / `UDS_SLOW` / `
 Built with [PlatformIO](https://platformio.org/):
 
 ```sh
-pio run -e esp32dev            # compile
-pio run -e esp32dev -t upload  # flash
+cp include/secrets.h.example include/secrets.h   # set your Traccar endpoint
+pio run -e esp32dev                              # compile
+pio run -e esp32dev -t upload                    # flash
 ```
+
+`include/secrets.h` holds the deployment-specific `SERVER_HOST` and is
+gitignored — the build fails without it rather than defaulting to a
+placeholder endpoint.
 
 The Freematics SDK lives under [`libraries/`](libraries) and is consumed as-is.
 

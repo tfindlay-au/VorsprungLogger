@@ -120,7 +120,7 @@ Build-time options live in `config.h`; a runtime NVS override (namespace
 | Setting | Current value | Notes |
 |---------|---------------|-------|
 | `CELL_APN` | `"hologram"` | `iot.1nce.net` staged (commented) for the pending 1NCE migration |
-| `SERVER_HOST` | `traccar.example.com` | Traccar endpoint |
+| `SERVER_HOST` | set in `secrets.h` | Traccar endpoint; see below |
 | `SERVER_PORT` / `SERVER_PROTOCOL` | `5170` / UDP | UDP only |
 | `SIM_CARD_PIN` | `""` | `checkSIM()` has a lockout guard to avoid PIN-retry exhaustion |
 | `GNSS` | `GNSS_STANDALONE` | onboard u-blox via co-processor — see §9 before changing |
@@ -138,6 +138,15 @@ Build-time options live in `config.h`; a runtime NVS override (namespace
 | `COOLING_DOWN_TEMP` | `75 °C` | purge buffers above this device temp |
 
 Runtime-overridable via NVS: `CELL_APN` (key `CELL_APN`).
+
+`SERVER_HOST` is deployment-specific and lives in `include/secrets.h`, which
+is gitignored; `config.h` includes it unconditionally, so a missing file is a
+compile error rather than a build that flashes and transmits nowhere. Copy
+`include/secrets.h.example` to create it. The split exists because the Traccar
+UDP protocol authenticates by device unique ID alone — there is no shared
+secret on the wire — so host plus device ID is enough for anyone to inject
+positions. Keep both out of the repo; the ID is derived from the ESP32 eFuse
+MAC (`genDeviceID`) and is not guessable unless published.
 
 ---
 
@@ -490,8 +499,8 @@ analysis, and it settles the solution space:
 > method as above, but against Traccar's Postgres (`tc_positions`) rather than
 > the SD dump, since the device is back online and transmitting.
 
-**Dataset:** 36-hour window ending 2026-06-19 11:16 UTC, device `Allroad`
-(`uniqueid ABCD1234`), **17,307 rows** across 11 drive sessions — including a
+**Dataset:** 36-hour window ending 2026-06-19 11:16 UTC, device `Allroad`,
+**17,307 rows** across 11 drive sessions — including a
 170-minute afternoon drive (session #10, 05:40–08:30 UTC = 15:40–18:30 AEST,
 9,882 rows) and a 94-minute return (session #11, 5,328 rows). OBD speed `10D`
 used as the independent motion reference as before.

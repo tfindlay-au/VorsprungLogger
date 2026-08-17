@@ -50,7 +50,9 @@
 #define SIM_CARD_PIN ""
 
 // Telemetry server settings (Traccar)
-#define SERVER_HOST "traccar.example.com"
+// SERVER_HOST is deployment-specific and lives in the gitignored secrets.h;
+// copy secrets.h.example to get started.
+#include "secrets.h"
 #define SERVER_PROTOCOL PROTOCOL_UDP
 #define SERVER_PORT 5170
 

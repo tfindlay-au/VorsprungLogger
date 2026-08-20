@@ -125,6 +125,17 @@ struct UDSDIDEntry {
 // atomically rather than scheduled by the round-robin (see processUDS).
 static inline bool udsIsGroupMember(const UDSDIDEntry& e) { return e.intervalCycles == UDS_GROUP; }
 
+// Physical plausibility, keyed off the table's own unit column so no per-DID
+// bounds have to be maintained. A reading outside these is not a measurement:
+// the ECU answered with a fault or not-available code that happens to decode
+// into a number. Same idea as the time anchor's epoch window.
+//
+static inline bool udsValuePlausible(const UDSDIDEntry& e, float v)
+{
+	if (e.unit[0] == 'C' && e.unit[1] == '\0') return v >= -60.0f && v <= 1500.0f;
+	return true;
+}
+
 // ---- decoders, grouped by encoding family (formulas validated Phase 2/3/5) ----
 
 // Temperatures (the only families that aren't pure scaling)

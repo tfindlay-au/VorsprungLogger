@@ -41,7 +41,12 @@ static RTC_NOINIT_ATTR uint32_t s_bootSeq;
 
 static const char* sourceName(uint8_t source)
 {
-  return source == TIME_SRC_GPS ? "GNSS" : "NET";
+  switch (source) {
+    case TIME_SRC_GPS:    return "GNSS";
+    case TIME_SRC_SERVER: return "SERVER";
+    case TIME_SRC_MODEM:  return "MODEM";
+    default:              return "NONE";
+  }
 }
 
 uint64_t timeTicks()
@@ -69,7 +74,9 @@ bool timeAnchorSet(uint8_t source, uint32_t utcSec, uint64_t tickUs)
   if (utcSec < ANCHOR_MIN_EPOCH || utcSec > ANCHOR_MAX_EPOCH) return false;
 
   portENTER_CRITICAL(&s_mux);
-  uint8_t prev = s_src;
+  uint8_t  prev     = s_src;
+  uint32_t prevUtc  = s_utc;
+  uint64_t prevTick = s_tick;
   bool accept = source >= s_src || tickUs > s_tick + ANCHOR_STALE_US;
   if (accept) {
     s_src = source;
@@ -90,7 +97,23 @@ bool timeAnchorSet(uint8_t source, uint32_t utcSec, uint64_t tickUs)
     Serial.print("[TIME] anchor ");
     Serial.print(sourceName(source));
     Serial.print(" epoch ");
-    Serial.println(utcSec);
+    Serial.print(utcSec);
+    if (prev != TIME_SRC_NONE) {
+      // What the outgoing anchor said this same instant was. A handover should
+      // move the clock by a second or two at most; anything larger means the
+      // source we had been trusting was lying, and every record stamped since
+      // it took over is wrong by this much. Printing it is what turns a silent
+      // corruption into an obvious one — the CCLK zone bug (SPDD §16.4) ran for
+      // a month precisely because this number was never shown.
+      int64_t predicted = (int64_t)prevUtc
+                        + ((int64_t)tickUs - (int64_t)prevTick) / 1000000LL;
+      Serial.print(" (");
+      Serial.print(sourceName(prev));
+      Serial.print(" was off by ");
+      Serial.print((long)((int64_t)utcSec - predicted));
+      Serial.print("s)");
+    }
+    Serial.println();
   }
   return true;
 }

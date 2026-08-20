@@ -257,6 +257,18 @@ static bool readUDSValue(const UDSDIDEntry& e, float& value)
   }
 
   value = e.decode(payload);
+  if (!udsValuePlausible(e, value)) {
+    // Treated exactly like a failed read: the PID simply does not go in this
+    // cycle's packet, rather than shipping a number nobody can distinguish
+    // from a measurement.
+    Serial.print("[UDS] ");
+    Serial.print(e.label);
+    Serial.print(" implausible ");
+    Serial.print(value, 2);
+    Serial.print(' ');
+    Serial.println(e.unit);
+    return false;
+  }
   Serial.print("[UDS] ");
   Serial.print(e.label);
   Serial.print('=');
@@ -357,14 +369,22 @@ void processUDS(CBuffer* buffer)
 bool initGPS()
 {
   if (sys.gpsBeginExt()) {
-    Serial.println("GNSS:OK(E)");
-  } else if (sys.gpsBegin()) {
-    Serial.println("GNSS:OK(I)");
-  } else {
-    Serial.println("GNSS:NO");
-    return false;
+    Serial.println("GNSS:EXTERNAL");
+    return true;
   }
-  return true;
+  // The fallback is real but it must not be quiet. The external module went
+  // undetected from the v1.1.0 flash (2026-07-11) until 2026-08-20 and nobody
+  // noticed, because the internal receiver is good enough that the data looked
+  // fine — only the hdop scaling (x10 external vs x100 internal) gave it away,
+  // a month later. The antenna fitted for it was doing nothing that whole time:
+  // HDOP p50 went 0.55 -> 1.0. See SPDD §16.4.
+  if (sys.gpsBegin()) {
+    Serial.println("GNSS:INTERNAL  <-- external module NOT detected, "
+                   "external antenna is unused");
+    return true;
+  }
+  Serial.println("GNSS:NONE");
+  return false;
 }
 
 bool processGPS(CBuffer* buffer)
@@ -543,6 +563,28 @@ void printTime()
 /*******************************************************************************
   Initializing all data logging components
 *******************************************************************************/
+// A VIN is exactly 17 characters drawn from a fixed alphabet: digits plus A-Z
+// less I, O and Q, which are excluded precisely so they cannot be misread as 1
+// and 0. Nothing else is a VIN.
+//
+// This matters because getVIN() reports a failed read *in band*: the adapter
+// answers with a 17-character placeholder ("EEPR0M-READ-ERR0R", zeros doing
+// duty for the missing O's) that passes every length check. It reached Traccar
+// on 1,114 of the 1,179 VIN rows in a 14-day window before anyone looked. The
+// hyphens are what give it away — no VIN has ever contained one.
+static bool vinIsValid(const char* s)
+{
+  int n = 0;
+  for (; s[n]; n++) {
+    if (n >= 17) return false;
+    char c = s[n];
+    bool ok = (c >= '0' && c <= '9')
+           || (c >= 'A' && c <= 'Z' && c != 'I' && c != 'O' && c != 'Q');
+    if (!ok) return false;
+  }
+  return n == 17;
+}
+
 void initialize()
 {
   bufman.purge();
@@ -579,9 +621,17 @@ void initialize()
   if (state.check(STATE_OBD_READY)) {
     char buf[128];
     if (obd.getVIN(buf, sizeof(buf))) {
-      memcpy(vin, buf, sizeof(vin) - 1);
-      Serial.print("VIN:");
-      Serial.println(vin);
+      if (vinIsValid(buf)) {
+        memcpy(vin, buf, sizeof(vin) - 1);
+        Serial.print("VIN:");
+        Serial.println(vin);
+      } else {
+        // Keep the previous value (possibly empty) rather than shipping the
+        // adapter's placeholder — see vinIsValid().
+        Serial.print("VIN:rejected \"");
+        Serial.print(buf);
+        Serial.println("\"");
+      }
     }
     int dtcCount = obd.readDTC(dtc, sizeof(dtc) / sizeof(dtc[0]));
     if (dtcCount > 0) {
@@ -714,7 +764,16 @@ void process()
   if (!state.check(STATE_MEMS_READY)) {
     deviceTemp = readChipTemperature();
   }
-  buffer->add(PID_DEVICE_TEMP, ELEMENT_INT32, &deviceTemp, sizeof(deviceTemp));
+  // Deci-degrees on the wire. `deviceTemp` is whole °C everywhere else — it is
+  // compared against COOLING_DOWN_TEMP directly — but PID 0x82 is defined as
+  // tenths, and Traccar's decoder duly divides by 10. Sending whole degrees
+  // made a 28-43 °C device report as 2.8-4.3 °C: a plausible-looking number,
+  // which is why it read as a broken sensor mapping rather than a scale error
+  // for as long as it did. Scaling here rather than in the fork's decoder keeps
+  // the wire format matching the stock protocol. Resolution stays 1 °C because
+  // the reading is truncated to int upstream of this point.
+  int deviceTempDeci = deviceTemp * 10;
+  buffer->add(PID_DEVICE_TEMP, ELEMENT_INT32, &deviceTempDeci, sizeof(deviceTempDeci));
 
   buffer->timestamp = (uint32_t)(tick / 1000);
   buffer->state = BUFFER_STATE_FILLED;
@@ -780,7 +839,7 @@ bool initCell(bool quick = false)
     // works underground — take it before the server is even contacted.
     uint32_t netTime;
     if (teleClient.cell.networkTime(netTime)) {
-      timeAnchorSet(TIME_SRC_NET, netTime, timeTicks());
+      timeAnchorSet(TIME_SRC_MODEM, netTime, timeTicks());
     }
 
 #if GNSS == GNSS_CELLULAR

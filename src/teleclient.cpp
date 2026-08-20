@@ -207,23 +207,35 @@ void CBufferManager::printStats()
 
 bool CellUDPTime::networkTime(uint32_t& utcSec)
 {
-  // +CCLK: "yy/MM/dd,hh:mm:ss+zz" — zz is the local zone's offset from GMT in
-  // quarter-hours, so subtracting it yields true UTC. A modem that never saw
-  // NITZ answers with its 1980 power-on default; timeAnchorSet() floors that.
+  // +CCLK: "yy/MM/dd,hh:mm:ss+zz". Per 3GPP TS 27.007 the time field is *local*
+  // and zz is that zone's offset from GMT in quarter-hours, so subtracting zz
+  // should yield UTC. This modem does not follow that: it answers with UTC
+  // already in the time field while still reporting zz (+40 here, AEST). The
+  // subtraction therefore double-counted and put the anchor exactly 36000 s in
+  // the past, mis-stamping every record built between modem-up and the Traccar
+  // LOGIN reply — 525 rows over a 14-day window, and 43 % of the server-side
+  // totalDistance corruption. See SPDD §16.4.
+  //
+  // A modem that never saw NITZ answers with its 1980 power-on default;
+  // timeAnchorSet() floors that.
   if (!sendCommand("AT+CCLK?\r")) return false;
   char* p = strstr(getBuffer(), "+CCLK:");
   if (!p) return false;
   p = strchr(p, '"');
   if (!p) return false;
+  char* q = strchr(++p, '"');
+  if (q) *q = 0;
 
   int yy, mo, dd, hh, mi, ss, tz = 0;
   char sign = '+';
-  if (sscanf(p + 1, "%d/%d/%d,%d:%d:%d%c%d", &yy, &mo, &dd, &hh, &mi, &ss, &sign, &tz) < 6)
+  if (sscanf(p, "%d/%d/%d,%d:%d:%d%c%d", &yy, &mo, &dd, &hh, &mi, &ss, &sign, &tz) < 6)
     return false;
 
-  int32_t offset = (int32_t)tz * 15 * 60;
-  if (sign == '-') offset = -offset;
-  utcSec = (uint32_t)((int32_t)timeCivilToEpoch(2000 + yy, mo, dd, hh, mi, ss) - offset);
+  Serial.print("[TIME] CCLK \"");
+  Serial.print(p);
+  Serial.println("\" taken as UTC");
+
+  utcSec = timeCivilToEpoch(2000 + yy, mo, dd, hh, mi, ss);
   return true;
 }
 
@@ -245,7 +257,7 @@ bool TeleClientUDP::notify(byte event, const char* payload)
   char buf[48];
   char cache[128];
   CStorageRAM netbuf;
-  netbuf.init(cache, 128);
+  netbuf.init(cache, sizeof(cache));
   netbuf.header(devid);
   netbuf.dispatch(buf, sprintf(buf, "EV=%X", (unsigned int)event));
   netbuf.dispatch(buf, sprintf(buf, "TS=%lu", millis()));
@@ -259,6 +271,17 @@ bool TeleClientUDP::notify(byte event, const char* payload)
   if (payload) {
     netbuf.dispatch(payload, strlen(payload));
   }
+  // No time PIDs here, deliberately. Traccar's decodeEvent() splits this packet
+  // on '=' only and looks at exactly four keys — ID, VIN, EV, TS — so any PID
+  // token added would be parsed off and dropped. It builds the row with
+  // getLastLocation(position, null), i.e. server arrival time and the previous
+  // known coordinates, which is why every VIN row was arrival-stamped and made
+  // up the whole residue of Finding A (SPDD §16.2). `TS=` above is millis()
+  // since boot, not an epoch, and is only echoed back in the ack.
+  //
+  // The fix is upstream of here instead: decodeEvent() returns null when no VIN
+  // is present, so rejecting an unreadable VIN (see vinIsValid) means no row is
+  // created at all rather than a junk one being stamped wrong.
   netbuf.tailer();
   for (byte attempts = 0; attempts < 3; attempts++) {
     if (!cell.send(netbuf.buffer(), netbuf.length())) break;
@@ -285,10 +308,25 @@ bool TeleClientUDP::notify(byte event, const char* payload)
     if (event == EVENT_LOGIN) {
       char *p = strstr(data, "TM=");
       if (p) {
-        // The server's own clock, one round-trip old. Coarser than GNSS but it
-        // arrives the moment the link comes up, which on a cold start is well
-        // before the first fix.
-        timeAnchorSet(TIME_SRC_NET, (uint32_t)atol(p + 3), timeTicks());
+        // The server's own clock, one round-trip old — authoritative UTC by
+        // definition, since it is the clock that stamps servertime. It outranks
+        // the modem, so where it exists it corrects the CCLK reading rather
+        // than racing it (SPDD §16.4).
+        //
+        // NOTE: this branch does not currently fire. Verified 2026-08-20
+        // against the deployed fork in ../traccar: decodeEvent() answers a
+        // login with "1#EV=<ev>,RX=1,TS=<ts>" and no TM= field at all, and the
+        // fork's local changes touch only decodePosition() (UDS PID naming),
+        // not the event path. What actually corrects the modem anchor in the
+        // field is GNSS acquiring *time* — which happens before a position fix,
+        // hence no `sat` on the rows in question — roughly 30-45 s in.
+        //
+        // Kept rather than deleted because the server side is ours to change:
+        // adding TM=<epoch> to that reply would make this a real, authoritative
+        // anchor one round-trip after modem-up, and would self-correct a bad
+        // CCLK reading instead of merely logging it. Until then, the
+        // MODEM->GNSS handover line in timeAnchorSet() is the one to watch.
+        timeAnchorSet(TIME_SRC_SERVER, (uint32_t)atol(p + 3), timeTicks());
       }
       p = strstr(data, "SN=");
       if (p) {

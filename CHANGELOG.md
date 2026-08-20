@@ -7,6 +7,53 @@ what identifies a flashed binary in a serial log.
 Versioning started at v1.1.0; earlier work is summarised at the bottom for
 continuity. Design rationale lives in `SPDD.md`, referenced by section.
 
+## v1.2.1 — 2026-08-20
+
+**Four data-integrity fixes from a 14-day Postgres health check.** Full
+analysis: SPDD §16.4 (41,488 rows, 2026-08-07 → 08-20, 44 drive sessions).
+v1.2.0 itself is confirmed working — zero-lag rows fell 92.5 % → 3.8 % and
+spool replays land at true capture time.
+
+Fixed
+
+- **`+CCLK` timezone double-count.** `networkTime()` subtracted the reply's
+  `+zz` offset per 3GPP TS 27.007, but this modem reports UTC in the time field
+  *and* `+40`, so the anchor landed exactly 36000 s in the past. Every record
+  built between modem-up and GNSS lock was stamped 10 hours early: 11 events /
+  525 rows (1.27 %) over 14 days, none carrying `sat`, and 43 % of the
+  server-side `totalDistance` corruption. Taken as UTC now.
+- **VIN rows.** `obd.getVIN()` signals failure in band with the 17-character
+  placeholder `EEPR0M-READ-ERR0R`, which passed every length check and reached
+  Traccar on 1,114 of 1,179 VIN rows. Now validated against the real VIN
+  alphabet (17 chars, digits plus A–Z less I/O/Q). Because Traccar's
+  `decodeEvent()` returns null with no VIN present, this also closes SPDD
+  §16.3's open item 1: those rows *were* the entire residue of arrival-stamped
+  rows (1,179 of 1,179, an exact partition), and they now stop being created
+  rather than being stamped wrong.
+- **ECU fault code decoded as a temperature.** `egt_b1s1` reported exactly
+  3003.6 °C on 20 rows (raw 0x76E4 through the J1979 scaling). Added a
+  plausibility bound keyed off the DID table's `unit` column, temperatures
+  only, treated as a failed read. Bound left loose (−60…1500 °C) so it does not
+  swallow the 1000–1300 °C `egt_b1s2` readings, which are genuine DPF
+  regenerations.
+- **`deviceTemp` off by 10×.** PID 0x82 is defined in tenths of a degree and
+  Traccar's decoder divides by 10, but the firmware sent whole °C — so a device
+  running at 28–43 °C reported 2.8–4.3 °C. Now sent as deci-degrees; internal
+  semantics (and the `COOLING_DOWN_TEMP` comparison) unchanged.
+
+Changed
+
+- `TIME_SRC_NET` split into `TIME_SRC_MODEM` (1) < `TIME_SRC_SERVER` (2), with
+  GNSS at 3. The two network sources shared a rank, making the anchor
+  last-writer-wins between them.
+- `timeAnchorSet()` prints how far out the outgoing anchor was on every
+  handover. The CCLK error hid for a month because that number was never shown.
+- `initGPS()` boot line is now `GNSS:EXTERNAL` / `GNSS:INTERNAL` / `GNSS:NONE`
+  (was `OK(E)`/`OK(I)`/`NO`), and the internal case says plainly that the
+  external module was not detected and its antenna is unused — which has been
+  true and silent since the v1.1.0 flash on 2026-07-11. Why detection fails is
+  not yet diagnosed; see SPDD §16.4.
+
 ## v1.2.0 — 2026-07-29
 
 **Monotonic back-stamping: every record now carries its own capture time.**

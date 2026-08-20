@@ -14,11 +14,19 @@
 * them, GPS payload or not.
 *
 * Sources, in rank order (see timeAnchorSet for the replacement rule):
-*   TIME_SRC_NET  cellular network time (AT+CCLK, NITZ-fed) and the Traccar
-*                 login reply. Second-level; available in an underground
-*                 garage where GNSS never locks.
-*   TIME_SRC_GPS  GNSS UTC. Sub-second, and the reference every "good" row in
-*                 Traccar already carries.
+*   TIME_SRC_MODEM   AT+CCLK, NITZ-fed. Lands first on a cold start and works
+*                    in an underground garage where GNSS never locks, but it is
+*                    the network's idea of the time and its zone handling is
+*                    modem-specific — treat it as the weakest source.
+*   TIME_SRC_SERVER  the Traccar login reply's TM=. Literally the clock that
+*                    stamps servertime, so it is authoritative UTC by
+*                    definition; arrives one round-trip after the modem does.
+*   TIME_SRC_GPS     GNSS UTC. Sub-second, and the reference every "good" row
+*                    in Traccar already carries.
+*
+* MODEM and SERVER shared one rank until v1.2.1, which made the anchor
+* last-writer-wins between them and let a mis-zoned CCLK reading stand for the
+* ~30-45 s until LOGIN completed. See SPDD.md §16.4.
 *
 * See SPDD.md §16.2 and TIME.md.
 *************************************************************************/
@@ -30,9 +38,10 @@
 
 class CStorage;
 
-#define TIME_SRC_NONE 0
-#define TIME_SRC_NET  1
-#define TIME_SRC_GPS  2
+#define TIME_SRC_NONE   0
+#define TIME_SRC_MODEM  1
+#define TIME_SRC_SERVER 2
+#define TIME_SRC_GPS    3
 
 // Monotonic microseconds since boot. 64-bit, so unlike millis() it does not
 // wrap (~585,000 years), and it is unaffected by settimeofday().

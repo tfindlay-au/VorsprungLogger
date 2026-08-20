@@ -739,6 +739,153 @@ Postgres method looking for: `devicetime == servertime` share falling from
 33 % toward ~0, no same-arrival-minute row bursts, and drained rows landing at
 plausible capture times.
 
+*Verified 2026-07-31 and re-verified over 14 days at §16.4. One claim from the
+original 7/31 check was wrong and is retracted there.*
+
+### 16.4 Fourteen-day health check — 2026-08-20
+
+Re-ran the §16.1 method over 336 h (41,488 rows, 2026-08-07 → 08-20, 44 drive
+sessions) after a 72 h pass surfaced anomalies. §16.3 is confirmed working:
+zero-lag rows fell from 92.5 % pre-fix to 3.8 %, and genuine spool drains
+replay correctly. Four defects came out of it, three of them fixed here.
+
+**Measure GNSS payload, not Traccar `valid`** — §16.2 item 2, finally done.
+Traccar reports 100 % `valid` because it carries the last position forward, so
+the metric cannot see a payload blackout. Counting `sat`/`io768` presence
+instead: **97.2 %** overall, per-session min 96.7 % / p50 99.1 %, zero sessions
+below 50 %. Finding B has not recurred in 44 sessions; treat it as closed.
+
+**Defect 1 — `+CCLK` timezone double-count (fixed).** `networkTime()` subtracted
+the reply's `+zz` offset to convert local time to UTC, per 3GPP TS 27.007. This
+modem does not follow the spec: it puts UTC in the time field *and* reports
+`+40`. The subtraction therefore landed the anchor exactly 36000 s in the past.
+
+The tell that separates this from a legitimate spool replay — and the reason it
+survived the 7/31 check — is **lag spread versus capture window**. A real drain
+holds records spanning the capture window and delivers them at one instant, so
+the spread matches the window (ratio 0.75–0.94 observed). These rows arrived
+*live*, merely mis-stamped, so devicetime tracked servertime and the spread
+collapsed (ratio 0.10–0.32). 11 events / 525 rows (1.27 %) over 14 days, lag
+pinned 36002–36016 s, and **0 of 525 carried `sat`** — exactly the
+pre-GNSS-lock population the mechanism predicts.
+
+*Retraction:* §16.3's "back-stamping proven across an overnight park, max lag
+36,030 s" (7/31, 164 rows) was this bug, not a drain — spread 28 s against a
+189 s window. Back-stamping is still proven, by other events: 7/24 22:29:50,
+227 rows, lag 51957→52130 s, spread 172 s ≈ window 232 s.
+
+Fixed by taking `+CCLK` as the UTC it is. Two pieces of hardening around it,
+since the real failure was that a 10-hour error stayed invisible for a month:
+`TIME_SRC_NET` is split into `TIME_SRC_MODEM` < `TIME_SRC_SERVER` so the two
+network sources stop being last-writer-wins at equal rank; and `timeAnchorSet()`
+now prints, on every handover, how far out the outgoing anchor was. A modem
+whose convention differs now announces itself on the first boot.
+
+*What corrects the anchor today, verified against the deployed decoder in
+`../traccar`:* not `TM=`. `decodeEvent()` answers a login with
+`1#EV=<ev>,RX=1,TS=<ts>` and no `TM=` field, and the fork's local changes touch
+only `decodePosition()` — so `TIME_SRC_SERVER` never fires and the
+`teleclient.cpp` branch feeding it is currently dead. GNSS acquiring *time*
+(before a position fix, hence no `sat` on those rows) is what ends the window,
+~30-45 s in. Kept rather than deleted because the server is ours: adding
+`TM=<epoch>` to that reply is a four-line change that would make the anchor
+authoritative one round-trip after modem-up and *self-correct* a bad CCLK
+reading rather than merely logging it. Recommended follow-up.
+
+**Defect 2 — VIN rows are junk and arrival-stamped (fixed).** `obd.getVIN()`
+signals a failed read in band, returning the 17-character placeholder
+`EEPR0M-READ-ERR0R`; it passed every length check and reached Traccar on 1,114
+of 1,179 VIN rows. The real VIN was last read 2026-08-16.
+
+Separately those VIN rows *are* the residual arrival-stamped rows — 1,179 of
+1,179, an exact partition, none carrying `sat`. That is §16.3's open item 1.
+The cause is server-side: `decodeEvent()` splits the event packet on `=` only
+and reads four keys (ID, VIN, EV, TS), so adding time PIDs to the packet
+achieves nothing — they are parsed off and dropped. It builds the row with
+`getLastLocation(position, null)`: arrival time, previous coordinates.
+
+The lever is that `decodeEvent()` returns `null` when no VIN is present. So
+validating the VIN against its actual alphabet (17 chars, digits plus A–Z less
+I/O/Q — the placeholder's hyphens disqualify it) removes the row entirely
+rather than fixing its timestamp. Item 1 closes as a side effect.
+
+**Defect 3 — the external GNSS module has been unused since v1.1.0 (fixed
+loudly, cause still open).** `initGPS()` falls back to the co-processor
+receiver when `gpsBeginExt()` fails, and said so only via `OK(E)`/`OK(I)`.
+The stored `hdop` scaling is a fingerprint of which path ran — external is
+`gps.hdop()/10` (HDOP×10), internal is `atoi()` of the ATGRR field (HDOP×100):
+
+| week | hdop p50 | path |
+|---|---|---|
+| 2026-05-18 … 06-01 | 79–101 | internal |
+| 2026-06-15 … 06-29 | **5–6** | **external**, HDOP 0.5–0.6 |
+| 2026-07-13 … 08-17 | 81–106 | internal, HDOP ~0.8–1.1 |
+
+The v1.1.0 diff does not touch hdop scaling, so a different path is executing.
+Independently confirmed ×100: stationary fix-to-fix jitter is p50 0.00 m /
+p90 1.25 m over 4,296 samples, which is HDOP ~1, not ~10. So the antenna fitted
+on 2026-06-19 (§16.1) has done nothing since 2026-07-11 — HDOP p50 0.55 → 1.0.
+It went unnoticed because the internal receiver is good enough that fix
+availability and payload both stayed excellent; the midnight bug went away
+because the soft-serial path was *deleted*, not because the new one engaged.
+
+The message is now explicit. Why detection fails is not yet diagnosed —
+`gpsBeginExt()` listens at 38400 and allows ~1.1 s for decodable NMEA, and
+sends `gpsSettings` only *after* success, so a module coming up at a different
+baud can never be detected. Confirm the path from the boot line before
+chasing it.
+
+**Defect 4 — an ECU fault code decoding as a temperature (fixed).**
+`egt_b1s1` reported exactly 3003.6 °C on 20 rows, one fixed value repeated —
+raw 0x76E4 through the J1979 scaling, not a recognisable bit-pattern sentinel.
+Handled with a plausibility bound keyed off the table's `unit` column, applied
+to temperatures only, and treated like a failed read so the PID is simply
+absent that cycle.
+
+The bound is deliberately loose (−60 … 1500 °C) so it does **not** swallow the
+95 `egt_b1s2` rows above 1000 °C. Those are real: they cluster on exactly two
+days, ramp smoothly second-to-second, and coincide with `regen_time` resetting
+96884 → 151 — DPF regenerations, against a 201 °C peak on an ordinary drive.
+They still exceed what that sensor should physically reach, so the `egt_b1s2`
+scaling deserves its own look; that question should not be settled by silently
+discarding the evidence.
+
+**Defect 5 — `deviceTemp` scaled wrong on the wire (fixed).** It held 16
+distinct values spanning 2.8–4.3 across 40,309 rows, which read as a broken
+sensor mapping. Reading the deployed decoder settled it: `case 0x82` does
+`Double.parseDouble(value) / 10.0`, because PID 0x82 is defined in tenths of a
+degree. The firmware was sending whole °C — `deviceTemp` is `(int)temp` and is
+compared directly against `COOLING_DOWN_TEMP` (75 °C) — so a device running at
+**28–43 °C** was reporting 2.8–4.3 °C. Entirely plausible numbers for a winter
+cabin, which is exactly why it looked like a mismapped field rather than a
+factor-of-ten error.
+
+Fixed on the firmware side (`deviceTemp * 10` at the PID, internal semantics
+unchanged) rather than in the fork's decoder, so the wire format keeps matching
+the stock protocol. Resolution stays 1 °C; the reading is truncated to `int`
+before it gets here. Note this makes the thermal-standby threshold newly
+meaningful — at a real 28–43 °C the device was never remotely near the 75 °C
+cutoff, but the reported value had been off by 10× in the safe direction.
+
+**Still open, not fixed here.**
+
+- `egt_b1s2` scaling, per above.
+- `totalDistance` non-monotonicity, revised from §16.3's verdict: 737 backward
+  jumps / 391.9 km over 14 days, of which **474 (389.8 km) are pairs that
+  arrived out of devicetime order**. Defects 1 and 2 account for most of it —
+  14 jumps adjacent to a CCLK row carry 170.3 km (43 %), all eight largest
+  jumps sit on a CCLK boundary, and VIN rows carry 96.5 km — so this should
+  largely resolve with them. Only 18 jumps (10 m total) are otherwise clean.
+  The residue is inherent to legitimate replay arriving out of order and is
+  genuinely server-side.
+
+**Field verification pending** — after flashing, confirm from the console that
+`GNSS:` reports EXTERNAL or INTERNAL, that `[TIME] CCLK "…" taken as UTC`
+matches wall-clock UTC, and that the MODEM→GNSS handover reports a delta of
+seconds rather than ~36000. Then re-run the 336 h query set: expect 10-hour lag
+events to vanish, zero-lag rows to fall to ~0 (VIN rows gone entirely unless the
+adapter starts reading again), and `totalDistance` regressions to drop sharply.
+
 ---
 
 ## 17. Build & Flash

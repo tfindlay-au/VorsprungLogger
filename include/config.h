@@ -6,7 +6,7 @@
 * Bump the version when behaviour changes and add an entry to CHANGELOG.md;
 * the build timestamp printed alongside it pins the exact binary either way.
 **************************************/
-#define FIRMWARE_VERSION "v1.2.0"
+#define FIRMWARE_VERSION "v1.2.1"
 
 /**************************************
 * Circular Buffer Configuration

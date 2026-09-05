@@ -170,6 +170,37 @@ void chimeConnected()
     playTune(tune, sizeof(tune) / sizeof(tune[0]));
 }
 
+// Which receiver initGPS() last announced. The chime fires on a change — boot,
+// or a mid-drive fallback - and stays quiet on a watchdog re-init that lands on
+// the same source, so it reports rather than nags.
+enum GnssSource { GNSS_SRC_NONE = 0, GNSS_SRC_EXTERNAL, GNSS_SRC_INTERNAL };
+GnssSource gnssSource = GNSS_SRC_NONE;
+
+// Two-note rising ping, high and short: the external module answered, so the
+// external antenna is actually carrying the fix.
+void chimeGnssExternal()
+{
+    static const int tune[][2] = {
+        {1568, 90},   // G6
+        {2349, 160},  // D7
+    };
+    playTune(tune, sizeof(tune) / sizeof(tune[0]));
+}
+
+// Three-note descending grumble, low and slow: fell back to the internal
+// receiver and the external antenna is doing nothing. Pitched well below
+// chimeGnssExternal() and chimeConnected() so the two cannot be confused at
+// highway noise levels — this is the one worth pulling over for.
+void chimeGnssInternal()
+{
+    static const int tune[][2] = {
+        {784, 150},   // G5
+        {659, 150},   // E5
+        {440, 300},   // A4
+    };
+    playTune(tune, sizeof(tune) / sizeof(tune[0]));
+}
+
 /*******************************************************************************
   Reading and processing OBD data
 *******************************************************************************/
@@ -370,6 +401,10 @@ bool initGPS()
 {
   if (sys.gpsBeginExt()) {
     Serial.println("GNSS:EXTERNAL");
+    if (gnssSource != GNSS_SRC_EXTERNAL) {
+      gnssSource = GNSS_SRC_EXTERNAL;
+      chimeGnssExternal();
+    }
     return true;
   }
   // The fallback is real but it must not be quiet. The external module went
@@ -381,9 +416,14 @@ bool initGPS()
   if (sys.gpsBegin()) {
     Serial.println("GNSS:INTERNAL  <-- external module NOT detected, "
                    "external antenna is unused");
+    if (gnssSource != GNSS_SRC_INTERNAL) {
+      gnssSource = GNSS_SRC_INTERNAL;
+      chimeGnssInternal();
+    }
     return true;
   }
   Serial.println("GNSS:NONE");
+  gnssSource = GNSS_SRC_NONE;
   return false;
 }
 
@@ -747,15 +787,28 @@ void process()
 
   bool success = processGPS(buffer);
 #if GNSS_RESET_TIMEOUT
+  static byte gnssResets = 0;
   if (success) {
     lastGPStick = millis();
+    gnssResets = 0;
     state.set(STATE_GPS_ONLINE);
   } else {
     if (millis() - lastGPStick > GNSS_RESET_TIMEOUT * 1000) {
-      sys.gpsEnd();
+      // Warm re-init first: keep the module powered so it keeps its ephemeris.
+      // Cutting power here was self-defeating — the cold start it forced needs
+      // 2-4 minutes, longer than the GNSS_RESET_TIMEOUT that triggered it, so
+      // the recovery could never catch up and the device just cycled. That
+      // loop is the 17-minute hole at 06:12-06:29 on 2026-09-05 (SPDD §16.5).
+      // Only a module that a warm re-init did not revive gets its power cut.
+      bool powerCycle = gnssResets > 0;
+      Serial.print("[GNSS] no data for ");
+      Serial.print(GNSS_RESET_TIMEOUT);
+      Serial.println(powerCycle ? "s - power cycling" : "s - warm re-init");
+      sys.gpsEnd(powerCycle);
       state.clear(STATE_GPS_ONLINE | STATE_GPS_READY);
       delay(20);
       if (initGPS()) state.set(STATE_GPS_READY);
+      gnssResets++;
       lastGPStick = millis();
     }
   }
@@ -1076,14 +1129,10 @@ void standby()
   // The telemetry task observes STATE_STANDBY and flushes/closes its spool
   // handles itself (see telemetry()); nothing to do here for storage.
 
-#if !GNSS_ALWAYS_ON && GNSS == GNSS_STANDALONE
-  if (state.check(STATE_GPS_READY)) {
-    Serial.println("[GNSS] OFF");
-    sys.gpsEnd(true);
-    state.clear(STATE_GPS_READY | STATE_GPS_ONLINE);
-    gd = 0;
-  }
-#endif
+  // GNSS deliberately stays powered and tracking through standby. Cutting it
+  // here forced a cold start on every single trip (see config.h). The task
+  // that decodes NMEA keeps running, so the module holds a live fix for the
+  // whole parked period and wake-up is a hot start.
 
   state.clear(STATE_WORKING | STATE_OBD_READY | STATE_STORAGE_READY);
   Serial.println("STANDBY");

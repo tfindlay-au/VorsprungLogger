@@ -337,8 +337,19 @@ first patching `FreematicsNetwork.cpp` for a `CELL_SIM7670` GNSS branch.
 - HDOP on the wire is **HDOP × 10** (`102` = 10.2, marginal; roof antenna → 1–2).
 - `gd->speed` is knots in the raw struct; `processGPS()` writes km/h (× 1.852).
 - `lastMotionTime` only updates at `kph ≥ 2`, feeding stationary-shutdown.
-- Proven cold-start TTFF on a window sill ≈ 69 s; position correct end-to-end to
-  Traccar.
+- Proven cold-start TTFF on a window sill ≈ 69 s; in-car, under the windscreen on
+  the internal receiver, 2026-09-05 measured **94–278 s**. The receiver is now kept
+  powered through standby so this is paid once per boot, not once per trip
+  (§16.5).
+- **A GPS-less record is not a gap.** Traccar back-fills the last known location
+  and marks the row `valid`, so it plots at a stale coordinate. Detect these with
+  `fixtime < devicetime`, never with `valid` (§16.5).
+
+**The `GNSS_RESET_TIMEOUT` recovery escalates:** first a warm re-init
+(`sys.gpsEnd(false)` — power and ephemeris retained), then a power cycle if that
+did not revive it. `gpsEnd()`'s `powerOff` argument defaults to `true`, which is
+what made the old unqualified `sys.gpsEnd()` call self-defeating (§16.5) — pass
+it explicitly.
 
 **Stale path to fix if cellular GNSS ever returns:** the `GNSS_RESET_TIMEOUT`
 block in `process()` unconditionally calls the standalone reset routines; it
@@ -359,6 +370,7 @@ tracks device temperature. Motion feeds both the standby decision and wakeup.
 ```
 vehicle stops → motionless timer expires → standby()
   ├── SD file closed, OBD co-processor slept, MEMS re-calibrated
+  ├── GNSS stays powered and tracking  ← never switched off (§16.5)
   └── waitMotion(-1) polls accel until motion ≥ MOTION_THRESHOLD (0.4 G)
         └── ESP.restart()   ← full reset (RESET_AFTER_WAKEUP = 1)
 ```
@@ -367,6 +379,13 @@ Full reset on wake is intentional: clean cellular re-registration, no stale stat
 machine. Stationary thresholds step the data interval 1 s → 2 s → 5 s as the
 vehicle sits (`STATIONARY_TIME_TABLE` / `DATA_INTERVAL_TABLE`). During standby the
 telemetry task pings every `PING_BACK_INTERVAL` (900 s).
+
+The device does **not** sleep in standby — `waitMotion()` busy-polls the MEMS —
+so leaving GNSS powered costs ~25 mA on top of an already-awake ESP32 and modem.
+That is why the receiver is no longer switched off here: the cold start it forced
+on every trip cost far more than the current does (§16.5). Note the wake-up
+`ESP.restart()` still blips GPIO12 (a strapping pin with an internal pull-down)
+for a few ms, which is a residual cold-start risk for the external module.
 
 ---
 
@@ -466,6 +485,9 @@ separates "no fix while driving" from "parked / cold-starting."
 - **Standby churn amplifies it.** With `GNSS_ALWAYS_ON = 0` (§11), GPS cold-starts
   on every wake (TTFF ≈ 69 s per §9). Several files take 400–600 cycles to their
   first fix, and short post-wake segments end before a fix ever arrives.
+  *(Confirmed and fixed 2026-09-05 — this turned out to be a far larger share of
+  the loss than assumed here; the receiver is no longer powered down. See
+  §16.5.)*
 
 **Conclusion — the core issue is lost *fix*, not lost *transmission*.** The gaps
 seen at the Traccar server are also gaps on the SD card: the position was never
@@ -490,7 +512,9 @@ analysis, and it settles the solution space:
   need a dedicated scaled-`int32`→float decoder (the generic `udsDecodeU32_4b`
   overflows float's exact-integer range for degrees × 1e7).
 - **Standby / `GNSS_ALWAYS_ON` tuning** is a cheap, independent win that removes
-  the cold-start amplifier regardless of the antenna outcome.
+  the cold-start amplifier regardless of the antenna outcome. *(Done 2026-09-05,
+  §16.5 — it was not merely an amplifier: cold-start churn alone accounted for
+  8.3 % blind time and ~16 % of plotted distance.)*
 
 ### 16.1 After external antenna fitted — 2026-06-19
 
@@ -885,6 +909,110 @@ matches wall-clock UTC, and that the MODEM→GNSS handover reports a delta of
 seconds rather than ~36000. Then re-run the 336 h query set: expect 10-hour lag
 events to vanish, zero-lag rows to fall to ~0 (VIN rows gone entirely unless the
 adapter starts reading again), and `totalDistance` regressions to drop sharply.
+
+---
+
+### 16.5 GNSS cold-start churn and the last-known-location artefact — 2026-09-05
+
+> **Snapshot: 2026-09-05.** Prompted by visible gaps between points on the
+> Grafana map despite the v1.2.0 spool/backfill working. 9,131 rows,
+> 00:14–06:43 UTC, seven driving sessions.
+
+**The spool is not the problem.** Every cellular outage was fully backfilled;
+records arrive with correct `devicetime` and a large `servertime - devicetime`
+lag (up to 1738 s). No rows are missing. The map gaps are rows that carry **no
+position**, not rows that never arrived.
+
+**Traccar substitutes the last known location.** `processGPS()` correctly emits
+no GPS PIDs when there is no fix (`main.cpp`, the `gd->lng == 0 && gd->lat == 0`
+and `lastGPStime == gd->time` returns). Traccar's Freematics decoder fills those
+in from the device's previous position, so the row lands with `valid = true` and
+a stale lat/lon. The tell is **`fixtime` frozen while `devicetime` advances** —
+the offset reached −1031 s in the 06:12 episode. Any coverage metric keyed on
+`valid` + non-zero coordinates therefore reads 100 % when the truth was 91.7 %;
+`tools/traccar_baseline.py cmd_stats` has this bug and should be read with it in
+mind.
+
+**Root cause: the receiver was powered down in standby.** `GNSS_ALWAYS_ON = 0`
+made `standby()` call `sys.gpsEnd(true)`, driving `PIN_GPS_POWER` (GPIO12) low
+for the whole parked period. Every trip therefore began with a full cold start.
+All seven sessions on 2026-09-05 opened with **94–278 s of no position**,
+acquiring from 3–5 satellites and climbing — the unmistakable signature of lost
+ephemeris. This is the amplifier §16 predicted in June and never actioned.
+
+**The 300 s watchdog made it worse.** The `GNSS_RESET_TIMEOUT` recovery in
+`process()` called `sys.gpsEnd()`, whose `powerOff` argument **defaults to
+`true`** (`FreematicsPlus.h`). So the recovery power-cycled the module, forcing
+another cold start that needs 2–4 min — longer than the 300 s timeout that
+triggered it. The loop could never catch up. The 16.9-minute hole at
+06:12:20–06:29:17 is that cycle eating itself.
+
+**Measured impact (deduplicated):**
+
+| Metric | Value |
+| --- | --- |
+| GNSS-blind time | 32.2 min of 388.9 min logged (**8.3 %**) |
+| Straight-line "teleport" drawn on the map | **28.6 km** |
+| Real recorded track | 152.0 km |
+| Share of the day's distance that is a straight line, not road | **~16 %** |
+
+**Duplicate replays — 18 % of rows.** 1,642 extra rows on 7,489 distinct
+timestamps. The cause is **not** a missing end-to-end acknowledgement: there is
+no end-to-end acknowledgement anywhere in this design. `inbound()` handles only
+`EVENT_SYNC`; `EVENT_ACK` is defined in `teleclient.h` and never handled, and
+Traccar's freematics decoder does not acknowledge data packets. What
+`TeleClientUDP::transmit()` actually returns is the result of `CellUDP::send()`,
+which writes `AT+CIPSEND` and waits **1000 ms** for the modem to answer
+`+CIPSEND:` (or `RECV FROM:`, also treated as success). False therefore means
+*the modem did not confirm on the AT channel in time*, or returned `ERROR` — by
+which point the datagram has usually already gone out. The record is spooled
+anyway and replayed later. Suspects for the false negative: the 1 s window
+itself, and the `cell.close()`/`cell.open()` the transmit path performs every
+64 packets, which can leave the modem busy for the following send. 977 duplicate pairs **disagree on position**, because an
+identical GPS-less packet arriving twice gets last-known-location substituted
+twice, at different times — two different coordinates. That is the 19.5 km
+saw-tooth at 05:23–05:25, which renders as violent zig-zagging.
+
+**External module still not detected.** HDOP p50 = 76 (÷100 scaling) and
+satellite count capped at 12 — the internal receiver. The antenna fitted
+2026-06-19 remains unused, as §16.4 found. Contributing cause: `gpsBeginExt()`
+allowed only 300 ms of settle plus 1.1 s of listening, and a cold-powered module
+needs about a second to boot before its first NMEA sentence.
+
+**Fixed in this change:**
+
+1. **GNSS is never powered down.** `GNSS_ALWAYS_ON` is removed rather than set
+   to 1 — the receiver is on, unconditionally. The NMEA decode task keeps
+   running through standby, so the module holds a live fix across the parked
+   period. Cost is ~25 mA on a device that already stays awake in standby
+   (`waitMotion()` busy-polls the MEMS; the modem pings every 900 s).
+2. **The watchdog warm-restarts first.** `sys.gpsEnd(false)` keeps power and
+   ephemeris; only a module that a warm re-init did not revive gets its power
+   cut on the second attempt.
+3. **The boot chime reports which receiver won.** `chimeGnssExternal()` is a
+   short rising two-note ping (G6→D7); `chimeGnssInternal()` is a low
+   descending three-note grumble (G5→E5→A4), pitched well below both it and
+   `chimeConnected()`. It fires on a change of source, so it announces at boot
+   and on a mid-drive fallback but stays silent on a watchdog re-init that lands
+   on the same receiver. This gives an in-car feedback loop for unplugging and
+   replugging the external module.
+4. **Detection window widened** from 1.1 s to 3 s in `gpsBeginExt()`. The extra
+   1.9 s is only ever spent when no external module answers.
+
+**Residual risk — the wake-up blip.** `standby()` still ends in `ESP.restart()`,
+and GPIO12 is an ESP32 strapping pin with an internal pull-down, so power to the
+external module is interrupted for a few milliseconds on every wake regardless
+of this change. Whether the module rides that out depends on its VBCKP backup.
+**Field check:** if TTFF after a stop is now seconds, the change is sufficient;
+if it is still minutes, the next step is to hold GPIO12 through reset or to drop
+`RESET_AFTER_WAKEUP`.
+
+**Field verification pending** — after flashing, confirm the GNSS chime is heard
+and matches the `GNSS:` console line, then re-run the gap analysis: expect the
+per-session blind window to fall from 94–278 s to single-digit seconds,
+GNSS-blind time from 8.3 % toward ~0 %, and the straight-line share from ~16 %
+to negligible. The duplicate-replay and last-known-location issues are server
+side and are **not** addressed here — see the hand-off in §16.6.
 
 ---
 

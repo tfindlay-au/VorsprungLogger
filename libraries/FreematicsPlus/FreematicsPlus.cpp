@@ -486,10 +486,16 @@ bool FreematicsESP32::gpsBeginExt(int baudrate)
     Serial.setPins(PIN_GPS_UART_RXD, -1);
     taskGPS.create(gps_console_decode_task, "GPS", 1);
 
-    // test run for a while to see if there is data decoded
+    // Test run for a while to see if there is data decoded. The window is
+    // 3 s, not the 1.1 s this used to allow: from a cold power-on the module
+    // needs about a second to boot before it emits its first NMEA sentence,
+    // and 300 ms of settle plus 1.1 s of listening was close enough to that
+    // to miss it intermittently - which is how a fitted external module went
+    // undetected for a month (SPDD §16.4). The extra 1.9 s is only ever spent
+    // when no external module answers.
     uint16_t s1 = 0, s2 = 0;
     gps.stats(&s1, 0);
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 30; i++) {
         delay(100);
         gps.stats(&s2, 0);
         if (s1 != s2) {

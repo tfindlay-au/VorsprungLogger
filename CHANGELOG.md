@@ -7,6 +7,82 @@ what identifies a flashed binary in a serial log.
 Versioning started at v1.1.0; earlier work is summarised at the bottom for
 continuity. Design rationale lives in `SPDD.md`, referenced by section.
 
+## v1.3.0 — 2026-09-05
+
+**The GNSS receiver is no longer powered down.** Fixes the cold-start churn that
+made every trip begin blind. Full analysis: SPDD §16.5 (9,131 rows,
+2026-09-05 00:14 → 06:43 UTC, seven drive sessions), prompted by visible gaps
+between points on the Grafana map.
+
+The gaps were not lost data — the v1.2.0 spool and backfill are working, and no
+rows were missing. They were rows carrying **no position**: `processGPS()`
+correctly emits no GPS PIDs without a fix, and Traccar's decoder then back-fills
+the last known location and marks the row `valid`. Standby was cutting GNSS
+power, so every trip cold-started. Measured cost on the day: **94–278 s blind at
+the start of all seven sessions, 8.3 % of logged time with no real fix, and
+28.6 km of the 152 km track drawn as straight lines — about 16 % of the plotted
+distance.**
+
+Fixed
+
+- **GNSS powered down in standby.** `standby()` called `sys.gpsEnd(true)`,
+  driving `PIN_GPS_POWER` (GPIO12) low for the whole parked period, so the
+  receiver lost its ephemeris and cold-started on every wake. It now stays
+  powered and tracking; the NMEA decode task keeps running, so the module holds
+  a live fix across the park. Costs ~25 mA on a device that does not sleep in
+  standby anyway — `waitMotion()` busy-polls the MEMS and the modem pings every
+  `PING_BACK_INTERVAL`. SPDD §16 predicted this in June as a "cheap, independent
+  win"; it was not a minor amplifier but the dominant cause.
+- **The GNSS watchdog power-cycled on first failure.** The `GNSS_RESET_TIMEOUT`
+  recovery called `sys.gpsEnd()`, whose `powerOff` argument defaults to `true`
+  — so recovery forced a cold start needing 2–4 minutes, longer than the 300 s
+  timeout that triggered it, and the device just cycled. That loop is the
+  16.9-minute hole at 06:12:20–06:29:17. It now warm-restarts first
+  (`sys.gpsEnd(false)`, power and ephemeris retained) and escalates to a power
+  cycle only if that did not revive the module.
+- **External-module detection window too short.** `gpsBeginExt()` allowed 300 ms
+  of settle plus 1.1 s of listening, but a cold-powered module needs about a
+  second to boot before its first NMEA sentence. Widened to 3 s — a contributing
+  cause of the silent fallback tracked since SPDD §16.4. The extra 1.9 s is only
+  ever spent when no external module answers.
+
+Added
+
+- **The boot chime now reports which receiver won.** `chimeGnssExternal()` is a
+  short rising two-note ping (G6→D7); `chimeGnssInternal()` is a low descending
+  three-note grumble (G5→E5→A4), pitched well below it and below
+  `chimeConnected()` so the three cannot be confused at road speed. It fires on
+  a *change* of source, so it announces at boot and on a mid-drive fallback but
+  stays silent on a watchdog re-init that lands on the same receiver. This gives
+  an in-car feedback loop for unplugging and replugging the external module,
+  which previously required a console.
+
+Changed
+
+- `GNSS_ALWAYS_ON` is **removed**, not set to `1`. The receiver is on,
+  unconditionally; the dead `#if` and the branch it guarded are gone.
+
+Known issues
+
+- **The wake-up blip is not addressed.** `standby()` still ends in
+  `ESP.restart()`, and GPIO12 is an ESP32 strapping pin with an internal
+  pull-down, so power to the external module is interrupted for a few
+  milliseconds on every wake regardless of this change. Whether the module
+  rides that out depends on its VBCKP backup. If TTFF after a stop is still
+  minutes rather than seconds, this is the cause; the next step would be holding
+  GPIO12 through reset or dropping `RESET_AFTER_WAKEUP`.
+- **Duplicate transmissions are unchanged**, at 18 % of rows on 2026-09-05.
+  `transmit()` returns whether the *modem* confirmed `AT+CIPSEND` within 1 s,
+  not whether the server received anything — there is no end-to-end
+  acknowledgement in this design at all. A false return usually means the
+  datagram already went out, and the record is spooled and replayed anyway.
+  Being handled server-side in the `vorsprung` views for now; a per-record
+  sequence number is the firmware-side fix if it becomes worth doing.
+- **Traccar's last-known-location substitution** means a GPS-less row is
+  indistinguishable from a real fix by the `valid` column. Detect these with
+  `fixtime < devicetime`. `tools/traccar_baseline.py` still has this bug and
+  overstates fix availability.
+
 ## v1.2.1 — 2026-08-20
 
 **Four data-integrity fixes from a 14-day Postgres health check.** Full

@@ -6,7 +6,7 @@
 * Bump the version when behaviour changes and add an entry to CHANGELOG.md;
 * the build timestamp printed alongside it pins the exact binary either way.
 **************************************/
-#define FIRMWARE_VERSION "v1.2.1"
+#define FIRMWARE_VERSION "v1.3.0"
 
 /**************************************
 * Circular Buffer Configuration
@@ -85,7 +85,14 @@
 * Change to GNSS_STANDALONE to use the built-in u-blox M10
 **************************************/
 #define GNSS GNSS_STANDALONE
-#define GNSS_ALWAYS_ON 0
+/* The receiver is never powered down. It used to be switched off in standby,
+ * which meant every trip began with a full cold start: 94-278 s with no
+ * position on 2026-09-05, 8.3% of the day's logged time blind, and 28.6 km of
+ * the track drawn as straight lines because Traccar back-fills a GPS-less
+ * record with the last known location. Keeping it powered costs ~25 mA on a
+ * device that already stays awake through standby (waitMotion() busy-polls the
+ * MEMS and the modem pings every PING_BACK_INTERVAL), and buys a hot start.
+ * See SPDD §16.5. */
 #define GNSS_RESET_TIMEOUT 300 /* seconds */
 
 /**************************************

@@ -7,6 +7,39 @@ what identifies a flashed binary in a serial log.
 Versioning started at v1.1.0; earlier work is summarised at the bottom for
 continuity. Design rationale lives in `SPDD.md`, referenced by section.
 
+## v1.3.1 — 2026-09-05
+
+**The external GNSS module is told what baud rate to speak.** v1.3.0 shipped the
+chime that reports which receiver won, and it reported the internal one — the
+external module fitted 2026-06-19 still was not being detected. Cause found by
+diffing `gpsBeginExt()` against upstream Freematics: the fork listens at 38400
+and sent the module *no* configuration at all before deciding whether it was
+there. Upstream always sends a baud-set command first. A module that came up at
+any other rate produced bytes that failed every checksum, so it was
+indistinguishable from an empty socket. See SPDD §16.6.
+
+Fixed
+
+- **Baud coercion before detection.** `gpsBeginExt()` now bit-bangs a u-blox
+  `CFG-VALSET` (RAM layer, `CFG-UART1-BAUDRATE` = 38400) at 38400, 115200, 9600
+  and 57600 before it starts listening. A packet sent at the wrong rate is
+  framing noise the module discards; the one at the right rate lands. It is sent
+  twice — once after 300 ms for a module that never lost power on a warm
+  re-init, once at ~1 s for one that is still booting from cold.
+- **The failure is now legible.** On no detection the boot log prints the count
+  of raw bytes seen on the receive pin. Non-zero means the module is wired and
+  talking at a rate the sweep did not reach; zero means nothing is on the pin.
+
+Known limitation
+
+- Fallback to the internal receiver is still **latched for the trip**.
+  `initGPS()` runs from `initialize()` only while `STATE_GPS_READY` is clear,
+  and the `GNSS_RESET_TIMEOUT` watchdog only fires when there is no GPS data at
+  all — which the internal receiver prevents. Deliberate: detection counts
+  checksum-valid NMEA sentences, which a u-blox emits with or without a fix, so
+  sky view (a garage, a tunnel) cannot cause the fallback. Re-probing would cost
+  a live gap to fix a case that does not arise.
+
 ## v1.3.0 — 2026-09-05
 
 **The GNSS receiver is no longer powered down.** Fixes the cold-start churn that

@@ -1012,7 +1012,75 @@ and matches the `GNSS:` console line, then re-run the gap analysis: expect the
 per-session blind window to fall from 94–278 s to single-digit seconds,
 GNSS-blind time from 8.3 % toward ~0 %, and the straight-line share from ~16 %
 to negligible. The duplicate-replay and last-known-location issues are server
-side and are **not** addressed here — see the hand-off in §16.6.
+side and are **not** addressed here, and remain open.
+
+---
+
+### 16.6 Why the external module was never detected — 2026-09-05
+
+The v1.3.0 chime (§16.5, fix 3) did its job on the first drive after flashing:
+it played the low descending grumble, i.e. `GNSS:INTERNAL`. The external module
+was plugged in. So the widened 3 s detection window was not the problem, and
+neither was sky view — worth stating plainly, because it is the intuitive
+suspect and it is wrong. `gpsBeginExt()` decides by counting **checksum-valid
+NMEA sentences** (`TinyGPS::_good_sentences`, incremented on checksum match
+irrespective of `_gps_data_good`), and a u-blox emits well-formed GGA and RMC
+with empty fields from the moment it boots, fix or no fix. A garage cannot
+suppress detection.
+
+**What upstream does that this fork does not.** Diffing `gpsBeginExt()` against
+`stanleyhuangyc/Freematics@master`:
+
+| | upstream | this fork (pre-v1.3.1) |
+|---|---|---|
+| receive path | hardware UART at the `baudrate` argument, default **115200** | UART0 console RX, fixed **38400** |
+| before listening | sends a UBX `CFG-VALSET` setting the module to 38400 (soft-serial path), or opens the UART at 115200 | **sends nothing** |
+| after detecting | applies `gpsSettings` (message rates) | applies `gpsSettings` |
+
+Both upstream paths establish the rate *before* deciding whether a module is
+present. The fork removed that step when it moved receive onto UART0 in v1.1.0
+(the soft-serial deletion, §16.2) and kept only the post-success
+`gpsSettings` — which the module can never receive, because it is sent only on
+a success that a rate mismatch prevents. A module that came up at anything but
+38400 was therefore permanently undetectable, and produced exactly the same
+observable as an empty socket: no valid sentences. That is the whole of the
+2026-07-11 → present regression, and it is consistent with everything §16.4
+measured (HDOP p50 0.55 → 1.0, ×10 → ×100 scaling, satellite count capped at
+12).
+
+**Fix (v1.3.1).** Before listening, bit-bang `CFG-VALSET` with
+`CFG-UART1-BAUDRATE` (key `0x40520001`) = 38400 on the **RAM layer** at 38400,
+115200, 9600 and 57600 in turn. A packet at the wrong rate is framing noise the
+module discards; the one at the right rate lands. RAM layer means it re-applies
+each boot and never writes the module's flash. It goes out twice — at 300 ms
+for a module that never lost power on a warm re-init, and again at ~1 s for one
+booting from cold — costing ~1 s that is spent whether or not a module answers.
+Transmit is unaffected by the console's baud because it is bit-banged on
+GPIO26; only the receive side is pinned to `Serial`'s 38400.
+
+**Making the next failure legible.** The failure branch now prints the count of
+raw bytes seen on the receive pin. Non-zero with nothing decoded means wired
+and talking at an unmatched rate (or a framing/level problem); zero means
+nothing is on the pin — a dead module, an unpowered one, or wiring. Those two
+were indistinguishable for two months.
+
+**Fallback stays latched for the trip, deliberately.** `initGPS()` runs from
+`initialize()` only while `STATE_GPS_READY` is clear, and the
+`GNSS_RESET_TIMEOUT` watchdog (§9) only fires after 300 s with *no* GPS data —
+which the internal receiver, once it takes over, prevents. So a boot that lands
+on internal stays internal until the next `ESP.restart()`, which `standby()`
+performs at the end of every parked period, so each trip re-probes from
+scratch. Periodic re-probing mid-drive would tear down and re-point UART0 RX
+for a live gap, to cover only a connector re-seated while driving. Not worth
+it while detection no longer depends on conditions that change during a trip.
+
+**Field verification pending** — after flashing, the chime must change to the
+rising two-note ping and the console must read `GNSS:EXTERNAL`. Then confirm in
+Traccar that HDOP returns to the ×10 scale (p50 ~5–6, not ~80–100) and the
+satellite count exceeds 12, as it did in the 2026-06-15 … 06-29 window. If it
+still falls back, the printed raw-byte count is the next branch: non-zero sends
+the investigation to rates outside the sweep or to signal levels, zero sends it
+to the molex wiring and GPIO12 power.
 
 ---
 

@@ -40,6 +40,24 @@ static Task taskGPS;
 static GPS_DATA gpsData = {0};
 // u-blox M10 commands for setting GGA to 5Hz, RMC to 1Hz and disabling NAV_PVT
 static const uint8_t gpsSettings[] = {0xB5, 0x62, 0x06, 0x8A, 0x13, 0x00, 0x01, 0x01, 0x00, 0x00, 0xBB, 0x00, 0x91, 0x20, 0x02, 0xAC, 0x00, 0x91, 0x20, 0x0A, 0x07, 0x00, 0x91, 0x20, 0x00, 0x32, 0x74};
+// u-blox CFG-VALSET on the RAM layer setting UART1 to 38400 bps, preceded by
+// two wake-up bytes. The module's current baud rate is the one thing that
+// cannot be discovered by listening: at any rate but 38400 its output decodes
+// as noise, no sentence passes checksum, and gpsBeginExt() concludes nothing
+// is plugged in - which is exactly how a fitted module stayed invisible from
+// 2026-07-11 onwards (SPDD 16.4). So the command goes out at every rate the
+// module could plausibly have come up at, before any listening happens. A
+// packet sent at the wrong rate is framing noise the module discards; the one
+// sent at the right rate lands. Whatever it woke at, it is at 38400 by the
+// time we listen. RAM layer, so it re-applies every boot and never persists.
+static const uint8_t gpsBaudSetting[] = {0x00, 0x00, 0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40, 0x00, 0x96, 0x00, 0x00, 0xC7, 0x2B};
+static const uint32_t gpsCandidateBaud[] = {38400, 115200, 9600, 57600};
+// Raw bytes seen on the receive pin since the last gpsBeginExt(). Counted
+// separately from decoded sentences because the two failures look identical
+// from outside: bytes arriving with nothing decoding means the module is
+// wired and talking at a rate we still do not match, zero bytes means nothing
+// is on the pin at all.
+static volatile uint32_t gpsRxBytes = 0;
 
 #ifndef ARDUINO_ESP32C3_DEV
 
@@ -89,6 +107,17 @@ static void softSerialTx(uint32_t baudrate, uint8_t c)
     while (getCycleCount() - start < duration);
 }
 
+// Shout the 38400 baud command at the module in every rate it might be
+// listening at. Cheap - 22 bytes per rate, ~90 ms for the set - and it turns
+// an undetectable module into a detectable one.
+static void gpsForceBaud38400()
+{
+    for (int i = 0; i < (int)(sizeof(gpsCandidateBaud) / sizeof(gpsCandidateBaud[0])); i++) {
+        for (int j = 0; j < (int)sizeof(gpsBaudSetting); j++)
+            softSerialTx(gpsCandidateBaud[i], gpsBaudSetting[j]);
+    }
+}
+
 #endif
 
 // The external GNSS module's NMEA stream arrives on the console UART's
@@ -106,6 +135,7 @@ static void gps_console_decode_task(void* inst)
             vTaskDelay(1);
             continue;
         }
+        gpsRxBytes++;
         if (gps.encode((char)c)) {
             gpsHasDecodedData = true;
         }
@@ -478,11 +508,22 @@ bool FreematicsESP32::gpsBeginExt(int baudrate)
     // reads console input. So the module's NMEA output takes over UART0's
     // receive channel, and the one-shot config commands to the module stay
     // bit-banged on the TX pin, where the CPU controls the timing and
-    // nothing can corrupt a listener. Both directions run at the module's
-    // native 38400 bps, which is why Serial runs at 38400 as well.
+    // nothing can corrupt a listener. The receive side only ever runs at
+    // 38400 - it is the console's baud and cannot be changed per-source -
+    // so the module is commanded to 38400 below rather than assumed to be
+    // there, which is what Serial.begin(38400) in main.cpp is matching.
     pinMode(PIN_GPS_UART_TXD, OUTPUT);
     setTxPinHigh();
     delay(300);
+    // Twice, because the module's readiness depends on how we got here. On a
+    // warm re-init it never lost power and is already listening, so the first
+    // set lands; on a cold power-on it needs about a second of boot before it
+    // will accept anything, so the second one is the one it hears. Sending
+    // both costs a second and removes the question.
+    gpsForceBaud38400();
+    delay(700);
+    gpsForceBaud38400();
+    gpsRxBytes = 0;
     Serial.setPins(PIN_GPS_UART_RXD, -1);
     taskGPS.create(gps_console_decode_task, "GPS", 1);
 
@@ -504,7 +545,12 @@ bool FreematicsESP32::gpsBeginExt(int baudrate)
             return true;
         }
     }
-    // no NMEA decoded: give the console its receive pin back, power down
+    // No NMEA decoded. Say which failure it was before handing the receive pin
+    // back, so the boot log distinguishes an unplugged module from one that is
+    // talking at a rate the coercion above did not reach.
+    Serial.print("[GNSS] external module not detected, ");
+    Serial.print(gpsRxBytes);
+    Serial.println(" raw bytes seen on RX");
     gpsEnd();
     return false;
 }

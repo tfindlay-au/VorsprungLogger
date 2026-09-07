@@ -1074,13 +1074,101 @@ scratch. Periodic re-probing mid-drive would tear down and re-point UART0 RX
 for a live gap, to cover only a connector re-seated while driving. Not worth
 it while detection no longer depends on conditions that change during a trip.
 
-**Field verification pending** — after flashing, the chime must change to the
-rising two-note ping and the console must read `GNSS:EXTERNAL`. Then confirm in
-Traccar that HDOP returns to the ×10 scale (p50 ~5–6, not ~80–100) and the
-satellite count exceeds 12, as it did in the 2026-06-15 … 06-29 window. If it
-still falls back, the printed raw-byte count is the next branch: non-zero sends
-the investigation to rates outside the sweep or to signal levels, zero sends it
-to the molex wiring and GPIO12 power.
+**Field verification failed — 2026-09-07.** Descending chime on every start.
+Traccar agreed independently: 2026-08-29 … 09-07 HDOP p50 69–111 (the ×100
+internal scale) and `sat` capped at exactly 12 every day. The raw-byte count
+read **17 in 3 s**. What that meant, and the fix, are §16.7.
+
+---
+
+### 16.7 Bench diagnosis: the module speaks 115200 — 2026-09-07
+
+The ONE+ and the external module came out of the car and onto the desk. Bench
+is valid without OBD: the co-processor is on the ONE+ and enumerates over USB,
+so `devType`, the internal fallback and the chime all behave; only OBD/UDS rows
+are absent.
+
+**What v1.3.1 printed:** `external module not detected, 17 raw bytes seen on
+RX`. Neither §16.6 branch fit cleanly — 17 bytes is nearly silence, not a
+stream at the wrong rate — so the probe was rewritten to answer three separate
+questions in one boot rather than guess again.
+
+**What v1.3.2 printed, first boot:**
+
+```
+[GNSS] rx pin idle-high: 0% unpowered, 98% powered
+[GNSS] probe  38400 bps  bytes=10    ok=0  bad=0  <C3><FD><C3><FD><C3><FD>...
+[GNSS] probe   9600 bps  bytes=40    ok=0  bad=0  <17><AE><FE><17><AE><02>L<A3>...
+[GNSS] probe 115200 bps  bytes=27    ok=1  bad=0  $GNRMC,,V,,,,,,,,,,N,V*3
+[GNSS] probe  38400 bps  bytes=27    ok=1  bad=0  $GNRMC,,V,,,,,,,,,,N,V*3
+[GNSS] external module at 38400
+GNSS:EXTERNAL
+```
+
+Read top to bottom:
+
+1. **Wiring and power are fine.** The receive pin sits LOW with GPIO12 low and
+   idles HIGH (98%) with it high — a live UART transmitter behind the molex,
+   switched by the power pin as designed. One line, and the whole "molex wiring
+   and GPIO12" branch of §16.6 is closed.
+2. **The module ships at 115200.** Which is also the default argument of
+   upstream's `gpsBeginExt(int baudrate = 115200)` — the clue was in the
+   signature the whole time. The `<C3><FD>` pairs at 38400 are 115200 data
+   sampled three times too slowly.
+3. **The module accepts `CFG-VALSET`.** Sent at 115200, after it had booted, it
+   moved to 38400 on the first attempt and the verify probe decoded at 38400.
+
+**Why 17 bytes was the wrong-rate signature after all.** The §16.6 assumption
+that a u-blox at any wrong rate would land hundreds of raw bytes in 3 s was
+wrong for *this* module: idling without a fix it emits one short `$GNRMC` per
+second, ~27 bytes. At 38400 that decodes to ~10 framing-garbage bytes per
+second. So the v1.3.1 count was consistent with "wired, wrong rate" — the
+branch §16.6 nominated first — and the diagnosis there was right. Only the
+coercion was wrong.
+
+**Why the v1.3.1 coercion missed.** It shouted at 115200 — the correct rate was
+in its list — at 0.3 s and 1.07 s after applying power, with interrupts
+enabled. A u-blox from cold needs about a second before its UART is accepting
+input, so the first send was certainly lost and the second was on the edge; and
+a FreeRTOS tick landing mid-byte at 115200 (8.7 µs per bit) corrupts the UBX
+checksum silently. Open loop, two attempts, no check. It never landed, and
+nothing said so.
+
+**v1.3.2 closes the loop.** `gpsBeginExt()` now:
+
+- samples the receive pin before and after power (the idle-high line above);
+- waits 1.5 s for the module to boot, once, up front;
+- **sweeps the receive rate** — `Serial.updateBaudRate()` re-clocks UART0 — at
+  115200, 38400, 9600, 57600, 19200, 4800, 230400, listening up to 2 s each,
+  moving on after 1 s of silence, stopping at the first checksum-valid sentence;
+- prints a per-rate line with byte count, good/bad sentence counts and the first
+  24 bytes (printable as text, else `<hex>`), all deferred until UART0 is back
+  at 38400 so the console can carry it;
+- if the rate found is not 38400, bit-bangs `CFG-VALSET` at *that* rate (three
+  times, each byte under a critical section — `gpsSendAt()`), then verifies at
+  38400. If the module refuses to move, the console UART is re-clocked to the
+  module's rate and stays there: GNSS data is the product, log lines are not.
+
+§16.6's claim that the module's rate "cannot be discovered by listening" is
+withdrawn; it was never true, only unexamined.
+
+Two state leaks fixed in passing, found by reading for the bug and neither the
+cause of a first-boot failure: `gpsBegin()` zeroed `m_pinGPSPower` on success,
+so any later external probe in the same boot ran unpowered; and `gpsBeginExt()`
+never cleared `FLAG_GNSS_USE_LINK`, so after an internal fallback its own
+`gpsEnd()` took the co-processor branch — leaking the decode task and leaving
+console RX on GPIO34. `taskGPS.create()`'s result is now checked and reported.
+
+**Ruled out at the desk, do not re-investigate:** `F_CPU` vs the real clock
+(`board_build.f_cpu` = 160 MHz matches the SDK's `CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ`,
+`CONFIG_PM_ENABLE` unset — `softSerialTx()` timing is correct); `analogRead(A0)`
+in the telemetry loop (A0 is GPIO36, not 34); `Serial.setPins(34, -1)` (IDF
+accepts an input-only pin as UART RX).
+
+**Field verification pending** — in the car, the chime is already the rising
+two-note ping. Next drive: Traccar HDOP p50 back to the ×10 scale (~5–6) and
+`sat` above 12. Every boot now prints the probe table, so the next regression
+of this kind costs one look at the log, not two months.
 
 ---
 

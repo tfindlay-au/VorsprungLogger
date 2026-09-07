@@ -7,6 +7,32 @@ what identifies a flashed binary in a serial log.
 Versioning started at v1.1.0; earlier work is summarised at the bottom for
 continuity. Design rationale lives in `SPDD.md`, referenced by section.
 
+## v1.3.2 — 2026-09-07
+
+**The external GNSS module is finally detected.** v1.3.1's baud coercion never
+landed: it fired at 0.3 s and 1.07 s after power-on, before a cold u-blox will
+accept input, with interrupts enabled, and never checked. Bench diagnosis with
+the module on the desk found it alive, correctly wired, and talking at
+**115200** — upstream's own `gpsBeginExt()` default. See SPDD §16.7.
+
+Fixed
+
+- **Closed-loop detection.** `gpsBeginExt()` sweeps the *receive* rate
+  (115200, 38400, 9600, 57600, 19200, 4800, 230400) by re-clocking UART0, and
+  stops at the first checksum-valid sentence. Once the rate is known it sends
+  `CFG-VALSET` at that rate and verifies the module moved to 38400. A module
+  that will not move keeps the console at its rate — data over log lines.
+- **Every boot prints a probe table**: receive-pin idle level before and after
+  power, then per rate the byte count, good/bad sentence counts and a sample of
+  what arrived. A dead module, an unwired pin, a wrong rate and a wrong
+  protocol each now look different in the log.
+- **Bit-banged UBX commands go out under a critical section** (`gpsSendAt()`),
+  so a tick interrupt cannot corrupt a packet mid-byte.
+- `gpsBegin()` no longer zeroes `m_pinGPSPower`, and `gpsBeginExt()` clears
+  `FLAG_GNSS_USE_LINK` on entry — an in-boot re-probe after an internal
+  fallback previously ran unpowered and leaked the decode task.
+- `taskGPS.create()` failure is reported instead of reading as "no module".
+
 ## v1.3.1 — 2026-09-05
 
 **The external GNSS module is told what baud rate to speak.** v1.3.0 shipped the

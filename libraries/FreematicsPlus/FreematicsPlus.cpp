@@ -41,23 +41,27 @@ static GPS_DATA gpsData = {0};
 // u-blox M10 commands for setting GGA to 5Hz, RMC to 1Hz and disabling NAV_PVT
 static const uint8_t gpsSettings[] = {0xB5, 0x62, 0x06, 0x8A, 0x13, 0x00, 0x01, 0x01, 0x00, 0x00, 0xBB, 0x00, 0x91, 0x20, 0x02, 0xAC, 0x00, 0x91, 0x20, 0x0A, 0x07, 0x00, 0x91, 0x20, 0x00, 0x32, 0x74};
 // u-blox CFG-VALSET on the RAM layer setting UART1 to 38400 bps, preceded by
-// two wake-up bytes. The module's current baud rate is the one thing that
-// cannot be discovered by listening: at any rate but 38400 its output decodes
-// as noise, no sentence passes checksum, and gpsBeginExt() concludes nothing
-// is plugged in - which is exactly how a fitted module stayed invisible from
-// 2026-07-11 onwards (SPDD 16.4). So the command goes out at every rate the
-// module could plausibly have come up at, before any listening happens. A
-// packet sent at the wrong rate is framing noise the module discards; the one
-// sent at the right rate lands. Whatever it woke at, it is at 38400 by the
-// time we listen. RAM layer, so it re-applies every boot and never persists.
+// two wake-up bytes. Sent once the module's current rate is known, at that
+// rate, to move it onto the 38400 the console UART listens at. RAM layer, so
+// it re-applies every boot and never persists to the module's flash.
 static const uint8_t gpsBaudSetting[] = {0x00, 0x00, 0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40, 0x00, 0x96, 0x00, 0x00, 0xC7, 0x2B};
-static const uint32_t gpsCandidateBaud[] = {38400, 115200, 9600, 57600};
-// Raw bytes seen on the receive pin since the last gpsBeginExt(). Counted
-// separately from decoded sentences because the two failures look identical
-// from outside: bytes arriving with nothing decoding means the module is
-// wired and talking at a rate we still do not match, zero bytes means nothing
-// is on the pin at all.
+// Rates the external module could plausibly have come up at. 115200 first:
+// it is what the module ships at and what upstream's gpsBeginExt() defaults
+// to, confirmed on the bench 2026-09-07. Detection listens at each in turn rather than guessing: the receive
+// side of UART0 can be re-clocked at will, so the module's rate is discovered,
+// not assumed. v1.3.1 instead shouted the 38400 command at every rate and hoped
+// - open loop, and it never worked (SPDD 16.6, 16.7).
+static const uint32_t gpsProbeBaud[] = {115200, 38400, 9600, 57600, 19200, 4800, 230400};
+// Raw bytes seen on the receive pin since the counter was last cleared, and
+// a sample of the first few. Counted separately from decoded sentences
+// because the failures look identical from outside: bytes arriving with
+// nothing decoding means the module is wired and talking at a rate we still
+// do not match, zero bytes means nothing is on the pin at all, and the sample
+// says whether what did arrive is NMEA, binary, or line noise.
 static volatile uint32_t gpsRxBytes = 0;
+#define GPS_PROBE_SAMPLE 24
+static volatile uint8_t gpsRxSample[GPS_PROBE_SAMPLE];
+static volatile uint8_t gpsRxSampleLen = 0;
 
 #ifndef ARDUINO_ESP32C3_DEV
 
@@ -107,15 +111,36 @@ static void softSerialTx(uint32_t baudrate, uint8_t c)
     while (getCycleCount() - start < duration);
 }
 
-// Shout the 38400 baud command at the module in every rate it might be
-// listening at. Cheap - 22 bytes per rate, ~90 ms for the set - and it turns
-// an undetectable module into a detectable one.
-static void gpsForceBaud38400()
+// Bit-bang a command to the module at a given rate. Each byte goes out under
+// a critical section: a FreeRTOS tick landing mid-byte stretches a bit and the
+// module discards the whole UBX packet on checksum, silently. One byte at
+// 4800 bps is 2 ms with interrupts off, short enough for every other UART's
+// hardware FIFO to ride out.
+static portMUX_TYPE gpsTxMux = portMUX_INITIALIZER_UNLOCKED;
+static void gpsSendAt(uint32_t baudrate, const uint8_t* cmd, int len)
 {
-    for (int i = 0; i < (int)(sizeof(gpsCandidateBaud) / sizeof(gpsCandidateBaud[0])); i++) {
-        for (int j = 0; j < (int)sizeof(gpsBaudSetting); j++)
-            softSerialTx(gpsCandidateBaud[i], gpsBaudSetting[j]);
+    for (int n = 0; n < len; n++) {
+        taskENTER_CRITICAL(&gpsTxMux);
+        softSerialTx(baudrate, cmd[n]);
+        taskEXIT_CRITICAL(&gpsTxMux);
     }
+}
+
+// Fraction of samples reading HIGH on the receive pin over `ms`. A powered
+// UART transmitter idles HIGH between bytes; an unpowered one sits LOW; an
+// open pin floats and reads as noise. Cheaper than any protocol question and
+// answers the one that matters first: is there a live transmitter on the pin.
+static int gpsRxPinHighPercent(int ms)
+{
+    pinMode(PIN_GPS_UART_RXD, INPUT);
+    uint32_t hi = 0, n = 0;
+    uint32_t t = millis();
+    while (millis() - t < (uint32_t)ms) {
+        hi += digitalRead(PIN_GPS_UART_RXD);
+        n++;
+        delayMicroseconds(50);
+    }
+    return n ? (int)(hi * 100 / n) : 0;
 }
 
 #endif
@@ -136,6 +161,7 @@ static void gps_console_decode_task(void* inst)
             continue;
         }
         gpsRxBytes++;
+        if (gpsRxSampleLen < GPS_PROBE_SAMPLE) gpsRxSample[gpsRxSampleLen++] = (uint8_t)c;
         if (gps.encode((char)c)) {
             gpsHasDecodedData = true;
         }
@@ -494,65 +520,150 @@ void FreematicsESP32::gpsEnd(bool powerOff)
     }
 }
 
+// Listen at one rate for up to `ms` and report what arrived. Returns the
+// number of checksum-valid sentences decoded in the window.
+struct GpsProbe {
+    uint32_t baud;
+    uint32_t bytes;
+    uint16_t good;
+    uint16_t bad;
+    uint8_t sample[GPS_PROBE_SAMPLE];
+    uint8_t sampleLen;
+};
+
+static void gpsProbeAt(GpsProbe& r, int ms)
+{
+    uint16_t g0, b0, g1, b1;
+    gps.stats(&g0, &b0);
+    gpsRxBytes = 0;
+    gpsRxSampleLen = 0;
+    Serial.flush();
+    Serial.updateBaudRate(r.baud);
+    uint32_t t = millis();
+    for (;;) {
+        delay(100);
+        gps.stats(&g1, &b1);
+        if (g1 != g0) break;                       // decoded: this is the rate
+        uint32_t el = millis() - t;
+        if (el >= (uint32_t)ms) break;
+        if (el >= 1000 && gpsRxBytes == 0) break;  // silent for a second: move on
+    }
+    r.bytes = gpsRxBytes;
+    r.good = g1 - g0;
+    r.bad = b1 - b0;
+    r.sampleLen = gpsRxSampleLen;
+    for (int i = 0; i < r.sampleLen; i++) r.sample[i] = gpsRxSample[i];
+}
+
+static void gpsProbePrint(const GpsProbe& r)
+{
+    char line[96];
+    snprintf(line, sizeof(line), "[GNSS] probe %6lu bps  bytes=%-5lu ok=%-3u bad=%-3u ",
+             (unsigned long)r.baud, (unsigned long)r.bytes, r.good, r.bad);
+    Serial.print(line);
+    for (int i = 0; i < r.sampleLen; i++) {
+        uint8_t c = r.sample[i];
+        if (c >= 0x20 && c < 0x7F) Serial.print((char)c);
+        else { snprintf(line, sizeof(line), "<%02X>", c); Serial.print(line); }
+    }
+    Serial.println();
+}
+
 bool FreematicsESP32::gpsBeginExt(int baudrate)
 {
     // Fixed wiring on this board (ONE+ Model B, TYPE 14): module TX -> molex
-    // pin GPIO34 (PIN_GPS_UART_RXD), module RX -> GPIO26 (PIN_GPS_UART_TXD).
-    // switch on GNSS power
+    // pin GPIO34 (PIN_GPS_UART_RXD), module RX -> GPIO26 (PIN_GPS_UART_TXD),
+    // module VCC switched by GPIO12 (m_pinGPSPower).
+    //
+    // All three ESP32 UARTs are spoken for (console, cellular, co-processor
+    // link), but only the console's transmit side is ever used - nothing
+    // reads console input. So the module's NMEA output takes over UART0's
+    // receive channel, and the one-shot config commands to the module are
+    // bit-banged on the TX pin. UART0 runs one baud for both directions, so
+    // the console is garbled for the duration of the sweep below and every
+    // line of the report is printed only once the rate is back at 38400.
+
+    // Electrical first. Sample the receive pin before and after power so the
+    // report separates a dead or unwired module from one that is alive and
+    // merely speaking a rate we have not tried.
+    m_flags &= ~FLAG_GNSS_USE_LINK;
+    int idleUnpowered = gpsRxPinHighPercent(200);
     if (m_pinGPSPower) {
         pinMode(m_pinGPSPower, OUTPUT);
         digitalWrite(m_pinGPSPower, HIGH);
     }
-    // All three ESP32 UARTs are spoken for (console, cellular, co-processor
-    // link), but only the console's transmit side is ever used - nothing
-    // reads console input. So the module's NMEA output takes over UART0's
-    // receive channel, and the one-shot config commands to the module stay
-    // bit-banged on the TX pin, where the CPU controls the timing and
-    // nothing can corrupt a listener. The receive side only ever runs at
-    // 38400 - it is the console's baud and cannot be changed per-source -
-    // so the module is commanded to 38400 below rather than assumed to be
-    // there, which is what Serial.begin(38400) in main.cpp is matching.
     pinMode(PIN_GPS_UART_TXD, OUTPUT);
     setTxPinHigh();
-    delay(300);
-    // Twice, because the module's readiness depends on how we got here. On a
-    // warm re-init it never lost power and is already listening, so the first
-    // set lands; on a cold power-on it needs about a second of boot before it
-    // will accept anything, so the second one is the one it hears. Sending
-    // both costs a second and removes the question.
-    gpsForceBaud38400();
-    delay(700);
-    gpsForceBaud38400();
-    gpsRxBytes = 0;
-    Serial.setPins(PIN_GPS_UART_RXD, -1);
-    taskGPS.create(gps_console_decode_task, "GPS", 1);
+    // A u-blox from cold needs about a second before its UART is up. Wait
+    // for it here, once, rather than have the first probe rate miss it.
+    delay(1500);
+    int idlePowered = gpsRxPinHighPercent(200);
 
-    // Test run for a while to see if there is data decoded. The window is
-    // 3 s, not the 1.1 s this used to allow: from a cold power-on the module
-    // needs about a second to boot before it emits its first NMEA sentence,
-    // and 300 ms of settle plus 1.1 s of listening was close enough to that
-    // to miss it intermittently - which is how a fitted external module went
-    // undetected for a month (SPDD §16.4). The extra 1.9 s is only ever spent
-    // when no external module answers.
-    uint16_t s1 = 0, s2 = 0;
-    gps.stats(&s1, 0);
-    for (int i = 0; i < 30; i++) {
+    // Route UART0 RX to the module and start decoding.
+    Serial.setPins(PIN_GPS_UART_RXD, -1);
+    bool taskOk = taskGPS.create(gps_console_decode_task, "GPS", 1);
+
+    // Sweep the receive rate. The first rate that yields a checksum-valid
+    // sentence is the module's rate; the rest are skipped.
+    const int nRates = sizeof(gpsProbeBaud) / sizeof(gpsProbeBaud[0]);
+    GpsProbe probe[nRates] = {};
+    int found = -1;
+    for (int i = 0; i < nRates && taskOk; i++) {
+        probe[i].baud = gpsProbeBaud[i];
+        gpsProbeAt(probe[i], 2000);
+        if (probe[i].good) { found = i; break; }
+    }
+    Serial.flush();
+    Serial.updateBaudRate(GPS_SOFT_BAUDRATE);
+
+    // Report. Every boot, a few lines: this is the record that would have
+    // shortened a two-month regression to one look at the log.
+    Serial.print("[GNSS] rx pin idle-high: ");
+    Serial.print(idleUnpowered);
+    Serial.print("% unpowered, ");
+    Serial.print(idlePowered);
+    Serial.println("% powered  (live UART idles ~100%, dead ~0%, open pin floats)");
+    if (!taskOk) Serial.println("[GNSS] decode task failed to start");
+    for (int i = 0; i < nRates && probe[i].baud; i++) {
+        gpsProbePrint(probe[i]);
+        if (i == found) break;
+    }
+
+    if (found < 0) {
+        Serial.println("[GNSS] external module not detected at any rate");
+        gpsEnd();
+        return false;
+    }
+
+    uint32_t rate = probe[found].baud;
+    if (rate != GPS_SOFT_BAUDRATE) {
+        // Known rate: tell the module to move to 38400 and check it did.
+        // Three sends, it costs nothing and a UBX packet lost to a glitch
+        // costs the trip.
+        for (int n = 0; n < 3; n++) gpsSendAt(rate, gpsBaudSetting, sizeof(gpsBaudSetting));
         delay(100);
-        gps.stats(&s2, 0);
-        if (s1 != s2) {
-            // apply GNSS settings (GGA at 5Hz, RMC at 1Hz, NAV-PVT off)
-            gpsSendCommand(gpsSettings, sizeof(gpsSettings));
-            return true;
+        GpsProbe verify = { GPS_SOFT_BAUDRATE };
+        gpsProbeAt(verify, 2000);
+        Serial.flush();
+        Serial.updateBaudRate(GPS_SOFT_BAUDRATE);
+        gpsProbePrint(verify);
+        if (!verify.good) {
+            // The module would not move. The console has to give: GNSS data
+            // is the product, log lines are not. Say so while it can still
+            // be read.
+            Serial.print("[GNSS] module ignored CFG-VALSET; console UART re-clocked to ");
+            Serial.println(rate);
+            Serial.flush();
+            Serial.updateBaudRate(rate);
+        } else {
+            rate = GPS_SOFT_BAUDRATE;
         }
     }
-    // No NMEA decoded. Say which failure it was before handing the receive pin
-    // back, so the boot log distinguishes an unplugged module from one that is
-    // talking at a rate the coercion above did not reach.
-    Serial.print("[GNSS] external module not detected, ");
-    Serial.print(gpsRxBytes);
-    Serial.println(" raw bytes seen on RX");
-    gpsEnd();
-    return false;
+    Serial.print("[GNSS] external module at ");
+    Serial.println(rate);
+    // apply GNSS settings (GGA at 5Hz, RMC at 1Hz, NAV-PVT off)
+    gpsSendAt(rate, gpsSettings, sizeof(gpsSettings));
+    return true;
 }
 
 bool FreematicsESP32::gpsBegin()
@@ -579,7 +690,6 @@ bool FreematicsESP32::gpsBegin()
         }
     } while (millis() - t < 1000);
     if (success) {
-        m_pinGPSPower = 0;
         return true;
     }
     gpsEnd();
@@ -675,9 +785,7 @@ int FreematicsESP32::gpsGetNMEA(char* buffer, int bufsize)
 
 void FreematicsESP32::gpsSendCommand(const uint8_t* cmd, int len)
 {
-    for (int n = 0; n < len; n++) {
-        softSerialTx(GPS_SOFT_BAUDRATE, cmd[n]);
-    }
+    gpsSendAt(GPS_SOFT_BAUDRATE, cmd, len);
 }
 
 bool FreematicsESP32::xbBegin(unsigned long baudrate, int pinRx, int pinTx)

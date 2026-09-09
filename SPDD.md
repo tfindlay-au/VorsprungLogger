@@ -1165,10 +1165,44 @@ console RX on GPIO34. `taskGPS.create()`'s result is now checked and reported.
 in the telemetry loop (A0 is GPIO36, not 34); `Serial.setPins(34, -1)` (IDF
 accepts an input-only pin as UART RX).
 
-**Field verification pending** — in the car, the chime is already the rising
-two-note ping. Next drive: Traccar HDOP p50 back to the ×10 scale (~5–6) and
-`sat` above 12. Every boot now prints the probe table, so the next regression
-of this kind costs one look at the log, not two months.
+**Field verified — 2026-09-09.** Two drives (25 min / 36 min, 3,045 rows).
+The external module is carrying the fix.
+
+| | internal (v1.3.1, 09-01…09-07, 17 drives) | external (v1.3.2, 2 drives) |
+|---|---|---|
+| stored `hdop` p50 / p90 | 86 / 158 | 5 / 6 |
+| **true HDOP** p50 / p90 | **0.86 / 1.58** | **0.50 / 0.60** |
+| fix availability | 100% | 100% |
+| moving-row fix | 100% | 100% |
+| time to first fix | 0 s | 0 s |
+
+**Read the scale before the improvement.** The two receivers encode HDOP
+differently and the raw column is not comparable: the external path stores
+`TinyGPS::hdop()/10`, i.e. HDOP×10 (`FreematicsPlus.cpp:771`), while the
+internal path stores the co-processor's `$GNIFO` field unscaled at HDOP×100
+(`:735`). So 86 → 5 is *not* a 17× improvement; it is 0.86 → 0.50, a ~42%
+reduction in dilution of precision, and the tail is the better result: p90
+1.58 → 0.60, ~62%. The external antenna makes the fix *tighter and far more
+consistent*, which is exactly what it was fitted for in June.
+
+**Fix availability was never the problem and has not changed** — both receivers
+sit at 100%, moving or stopped, and TTFF is 0 s on both since v1.3.0 stopped
+powering the module down (§16.5). Anyone re-baselining this should measure DOP,
+not fix rate.
+
+**§16.6's `sat > 12` criterion was wrong; it is withdrawn.** GGA's
+"satellites in use" field is capped at 12 by NMEA 0183, so both receivers
+report 12 whenever the fix is good, and the June external window shows the same
+p50 of 12. The nine June rows above 12 that the criterion was built on read 59,
+92, 174 and 193 — impossible satellite counts, and artefacts of the bit-banged
+NMEA corruption that v1.1.0 fixed (§16.2). A prediction was inferred from
+nine corrupt rows and it cost nothing only because HDOP settled the question
+independently. **HDOP scale is the receiver fingerprint; satellite count is
+not.**
+
+One 140 s gap in the second drive, mid-session with the engine warm
+(`coolantTemp` 85 either side) — a cell dropout that the spool did not backfill,
+unrelated to GNSS. Not chased; noted here in case it recurs.
 
 ---
 

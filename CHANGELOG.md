@@ -9,6 +9,11 @@ continuity. Design rationale lives in `SPDD.md`, referenced by section.
 
 ## v1.3.2 — 2026-09-07
 
+**Field verified 2026-09-09:** external module carrying the fix over two
+drives — true HDOP p50 0.86 → 0.50, p90 1.58 → 0.60. Fix availability was
+already 100% and is unchanged. See SPDD §16.7 for the scale caveat (the raw
+`hdop` column is ×100 on internal, ×10 on external — not comparable directly).
+
 **The external GNSS module is finally detected.** v1.3.1's baud coercion never
 landed: it fired at 0.3 s and 1.07 s after power-on, before a cold u-blox will
 accept input, with interrupts enabled, and never checked. Bench diagnosis with

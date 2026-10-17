@@ -6,9 +6,9 @@ retained), narrowed to one vehicle and one job: log a 2017 Audi A6 Allroad
 (3.0 TDI, EA897 evo) over OBD-II + UDS, plus GPS/MEMS, to SD and to a Traccar
 server over cellular.
 
-This document is the single source of design truth. It supersedes the earlier
-SPDD, `PROJECT_CONTEXT.md`, `UDS_Implementation_Plan.md`, and the derived-inputs
-brief, which have been folded in here.
+This document is the design reference. `TIME.md` covers record timestamping in
+depth, `CHANGELOG.md` the per-release history, and §16 here is the dated field
+log with a current status table at its head.
 
 ---
 
@@ -17,10 +17,13 @@ brief, which have been folded in here.
 Turn a Freematics ONE+ Model B into a vehicle telemetry logger that:
 
 - reads OBD-II live PIDs from the engine ECU;
-- reads ~50 manufacturer-specific **UDS DIDs** (ISO 14229, service 0x22) from the
+- reads 51 manufacturer-specific **UDS DIDs** (ISO 14229, service 0x22) from the
   VAG EA897 powertrain — EGTs, pressures, air/fuel flow, torque, DPF, SCR/NOx;
-- records position via the onboard u-blox GNSS and motion via the MEMS;
-- logs everything to SD as CSV and streams it over UDP to a Traccar endpoint.
+- records position via a u-blox GNSS receiver (external module preferred,
+  onboard receiver as fallback) and motion via the MEMS;
+- streams every record over UDP to a Traccar endpoint, stamped with its own
+  capture time; anything unsent during a cell outage is spooled to SD and
+  replayed when the link returns.
 
 The point of the UDS work is the rich signal set behind VAG's diagnostic space:
 generic OBD-II (Mode 0x01) exposes ~20 PIDs; the interesting diesel signals live
@@ -38,56 +41,87 @@ This unit reports `TYPE:14` at boot (`sys.devType`, set from `ATI`) — a ONE+
 | MCU | ESP32 (Xtensa LX6, 160 MHz, no PSRAM) |
 | OBD co-processor | Freematics co-processor over UART2 (`LINK_UART_NUM`), ELM327-compatible CAN |
 | Cellular modem | **SIM7670G-LN** (auto-detected at boot via `ATI`; SIM7600/7070/5360 also handled) |
-| GNSS | Onboard u-blox, reached **through the OBD co-processor** (`ATGPSON`/`ATGPS`) — see §9 |
+| GNSS (primary) | **External u-blox module** on the molex header: module TX → GPIO34 (UART0 RX, shared with the console), module RX ← GPIO26 (bit-banged UBX commands), VCC switched by GPIO12. External antenna fitted 2026-06-19. See §9 |
+| GNSS (fallback) | Onboard u-blox, reached **through the OBD co-processor** (`ATGPSON`/`ATGPS`); used only when no external module answers at boot |
 | MEMS | ICM-42627 (primary) or ICM-20948 (fallback), auto-detected over I2C |
-| Storage | MicroSD, FAT32, files at `/DATA/<n>.CSV` |
+| Storage | MicroSD, FAT32, used only as the outage spool: `/SPOOL/<seq>.PKT` (§14) |
+| Buzzer | GPIO25; connect and GNSS-source chimes (§9, §12) |
 | Power | Vehicle OBD-II port (12 V) |
 
 The SIM7670G's own GNSS engine is **not** used (the fork's driver lacks a 7670
 branch — §9). The u-blox standalone path is strictly better on this board.
 
+Because the external module's receive line is UART0 RX, **the console runs at
+38400 baud** (`Serial.begin(38400)` in `main.cpp`, `monitor_speed` in
+`platformio.ini`), the rate the module is configured to at boot.
+
 ---
 
 ## 3. Firmware Architecture
 
-Two cooperating execution contexts on core 1, communicating only through a
-shared ring buffer — no shared mutable device state, so no locks.
+Two cooperating execution contexts on core 1, communicating through a shared
+ring buffer plus one small shared value: the UTC time anchor, written by the
+main loop and read by the telemetry task under a spinlock (`TIME.md`). No other
+shared mutable device state, so no other locks.
 
 ```
  loop() / process()                    telemetry()  [FreeRTOS task, prio 2, 8 KB]
  ─────────────────────                 ──────────────────────────────────────────
- processOBD()   OBD-II PIDs            cellular connect / reconnect
- processUDS()   UDS DIDs               pull newest buffer → CStorageRAM → UDP
- processMEMS()  accel / gyro           RSSI monitoring, ping-back in standby
- processGPS()   u-blox via link        server-sync watchdog
- SD write (CSVlogger)
-        │                                       ▲
+ capture tick (timeTicks)              cellular connect / reconnect, AT+CCLK → anchor
+ processOBD()   OBD-II PIDs            pull newest buffer → buildPacket() → UDP
+ processUDS()   UDS DIDs                 └ on send failure → RecordSpool (SD)
+ processMEMS()  accel, device temp     while disconnected: spool queued buffers
+ processGPS()   GNSS → anchor + PIDs   idle gaps: drain one spooled record
+ GNSS watchdog                         RSSI monitoring, ping-back in standby
+        │                              server-sync watchdog
         └──────────►  CBufferManager  ──────────┘
                       (32 slots × 256 B ring)
+
+ third context: taskGPS (prio 1) decodes NMEA from UART0 RX into GPS_DATA
 ```
 
-`process()` fills one `CBuffer` per cycle and marks it `FILLED`. `telemetry()`
-takes the **newest** filled buffer, serialises it, transmits, and frees it; if
-production outruns transmission, older buffers are dropped rather than queued
-unbounded.
+`process()` fills one `CBuffer` per cycle and marks it `FILLED`. While the link
+is up, `telemetry()` takes the **newest** filled buffer, serialises it,
+transmits, and frees it; if production outruns transmission, older buffers are
+dropped rather than queued unbounded. While the link is down, queued buffers
+are written oldest-first to the SD spool before and during each reconnect
+attempt, so nothing is lost across an outage (§14).
 
 ### Source layout
 
 ```
 src/
-  main.cpp        entry point: setup/loop, process(), the OBD+UDS schedulers, standby
-  teleclient.cpp  TeleClientUDP, CBuffer / CBufferManager
-  telestore.cpp   SDLogger (CSV) + CStorageRAM (TX serialisation)
+  main.cpp        entry point: setup/loop, process(), the OBD+UDS schedulers,
+                  initGPS/processGPS, buildPacket(), telemetry task, standby
+  teleclient.cpp  TeleClientUDP, CellUDPTime::networkTime, CBuffer / CBufferManager
+  telestore.cpp   CStorageRAM (packet serialisation) + RecordSpool (SD outage spool)
+  timeanchor.cpp  monotonic ticks, tiered UTC anchor, time-PID stamping (TIME.md)
   dataserver.cpp  stub (serverProcess = delay; HTTPD removed)
 include/
-  config.h        all build-time configuration
+  config.h        all build-time configuration, FIRMWARE_VERSION
+  secrets.h       SERVER_HOST — gitignored; copy from secrets.h.example
   uds_dids.h      the per-vehicle UDS DID table + decoders (the swap-a-car file)
-  teleclient.h    CBuffer, CBufferManager, TeleClientUDP
-  telestore.h     CStorage, SDLogger, CStorageRAM
+  teleclient.h    CBuffer, CBufferManager, TeleClientUDP, CellUDPTime
+  telestore.h     CStorage, CStorageRAM, RecordSpool
+  timeanchor.h    TIME_SRC_* ranks and the anchor API
 libraries/
-  FreematicsPlus/ upstream Freematics SDK (HAL, OBD, MEMS, network, UDS) — used as-is
-platformio.ini    build: env esp32dev, 160 MHz, huge_app partition
+  FreematicsPlus/ upstream Freematics SDK (HAL, OBD, MEMS, network, UDS).
+                  Modified in this fork: FreematicsPlus.cpp gpsBegin/gpsBeginExt/
+                  gpsEnd (external-module detection on UART0 RX, baud sweep,
+                  CFG-VALSET, probe log) and FreematicsGPS.cpp (NMEA parser
+                  hardening). Everything else is upstream as shipped.
+  FreematicsONE/, FreematicsOLED/, httpd/, TinyGPS/  upstream, unused by this build
+tools/
+  traccar_baseline.py  Postgres queries behind the §16 field checks
+platformio.ini    build: env esp32dev, 160 MHz, huge_app partition, monitor 38400
+CHANGELOG.md      per-release notes, keyed to FIRMWARE_VERSION
 ```
+
+Not in the public repo (gitignored, deployment-specific): `homeassistant/`
+(Home Assistant dashboard and template sensors) and `sql/` (the `vorsprung`
+Postgres reporting schema over Traccar's `tc_positions`). The deployed Traccar
+is a local fork whose Freematics decoder maps the `0x200+` PIDs to named
+attributes; stock Traccar stores them as `io<decimal>`.
 
 ---
 
@@ -100,15 +134,30 @@ Each transmitted packet is one text frame built by `CStorageRAM`:
 ```
 
 - PIDs are **uppercase hex**; values are decimal (UDS DIDs emit as `FLOAT_D2`).
-- The leading `0:<ms>` is the timestamp PID; `*<checksum>` is a byte-sum hex tail.
-- The same serialisation feeds both the UDP path and the SD CSV — UDS-derived
-  values flow through unchanged, no downstream special-casing.
+- The leading `0:<ms>` is the relative timestamp PID (capture tick in ms since
+  boot); `*<checksum>` is a byte-sum hex tail.
+- **Every packet ends with the time triplet** `10:<HHMMSScc>`, `11:<DDMMYY>`,
+  `300:<epoch>`, written by `buildPacket()` from the record's capture tick and
+  the UTC anchor — not from GNSS directly, so it is present with or without a
+  fix. Traccar rebuilds `devicetime` from `10`/`11`; `300` lands as `io768`.
+  See `TIME.md`.
+- The exact bytes that would have gone on the wire are what the SD spool
+  stores on a failed send (§14) — UDS-derived values flow through unchanged, no
+  downstream special-casing.
 
-Example (GPS PIDs visible as `A`/`B`/`C`/`D`/`E`/`F`/`12`/`10`):
+Example (GPS PIDs `A` lat, `B` lng, `C` alt, `D` speed km/h, `E` heading,
+`F` sats, `12` HDOP; `82` device temp in tenths; `24` battery in centivolts):
 
 ```
-ABCD1234#0:82838,...,10:11193940,A:-37.813600,B:144.963100,C:91,D:0.1,E:0,F:8,12:102,...
+ABCD1234#0:82838,10D:0,10C:812,...,A:-37.813600,B:144.963100,C:91,D:0.1,E:0,F:8,12:102,82:310,10:11193940,11:180926,300:1789730379*7B
 ```
+
+(values illustrative; the checksum is not computed for this line)
+
+Two wire-scale traps that have each cost a diagnosis: `12` (HDOP) is HDOP×10
+from the external receiver but HDOP×100 from the internal one (§9), and `82`
+(device temperature) is tenths of a degree because that is how PID `0x82` is
+defined and how Traccar divides it (§16.4, defect 5).
 
 ---
 
@@ -119,15 +168,18 @@ Build-time options live in `config.h`; a runtime NVS override (namespace
 
 | Setting | Current value | Notes |
 |---------|---------------|-------|
+| `FIRMWARE_VERSION` | `"v1.3.2"` | printed at boot with the build timestamp; bump with every behaviour change and add a `CHANGELOG.md` entry |
 | `CELL_APN` | `"hologram"` | `iot.1nce.net` staged (commented) for the pending 1NCE migration |
 | `SERVER_HOST` | set in `secrets.h` | Traccar endpoint; see below |
 | `SERVER_PORT` / `SERVER_PROTOCOL` | `5170` / UDP | UDP only |
 | `SIM_CARD_PIN` | `""` | `checkSIM()` has a lockout guard to avoid PIN-retry exhaustion |
-| `GNSS` | `GNSS_STANDALONE` | onboard u-blox via co-processor — see §9 before changing |
-| `STORAGE` | `STORAGE_SD` | FAT32 MicroSD |
+| `GNSS` | `GNSS_STANDALONE` | u-blox, external module preferred — see §9 before changing |
+| `GNSS_RESET_TIMEOUT` | `300 s` | no GPS data for this long → warm re-init, then power cycle (§9) |
+| `STORAGE` | `STORAGE_SD` | FAT32 MicroSD, spool only (§14) |
 | `ENABLE_MEMS` / `ENABLE_OBD` | `1` / `1` | MEMS required for motion wakeup |
 | `ENABLE_WIFI/OLED/HTTPD/BLE/ORIENTATION` | `0` | trimmed off |
 | `BUFFER_SLOTS` × `BUFFER_LENGTH` | `32` × `256 B` | ring depth (no PSRAM) |
+| `SERIALIZE_BUFFER_SIZE` | `1024 B` | one wire packet; also the spool record ceiling |
 | `DATA_INTERVAL_TABLE` | `{1000,2000,5000}` ms | cycle period by stationary tier |
 | `STATIONARY_TIME_TABLE` | `{10,60,180}` s | motionless thresholds → interval/standby |
 | `MOTION_THRESHOLD` | `0.4 G` | wakeup sensitivity |
@@ -137,7 +189,13 @@ Build-time options live in `config.h`; a runtime NVS override (namespace
 | `SIGNAL_CHECK_INTERVAL` / `PING_BACK_INTERVAL` | `10 s` / `900 s` | RSSI poll / standby keepalive |
 | `COOLING_DOWN_TEMP` | `75 °C` | purge buffers above this device temp |
 
-Runtime-overridable via NVS: `CELL_APN` (key `CELL_APN`).
+Runtime-overridable via NVS (namespace `storage`): `CELL_APN` (key `CELL_APN`).
+
+Defined in `config.h` but **referenced nowhere** (inherited from upstream, kept
+only so the file still reads like a Telelogger config): `RESET_AFTER_WAKEUP`,
+`JUMPSTART_VOLTAGE`, `MAX_CONN_TIME`, `DATA_RECEIVING_TIMEOUT`, `PIN_SENSOR1`,
+`PIN_SENSOR2`. Changing them does nothing; in particular the restart at the end
+of standby is unconditional (§11).
 
 `SERVER_HOST` is deployment-specific and lives in `include/secrets.h`, which
 is gitignored; `config.h` includes it unconditionally, so a missing file is a
@@ -276,6 +334,14 @@ Gotchas baked into the decoders: cast signed families to `int16_t` before
 scaling (else negatives wrap to ~65500); 4-byte values arrive big-endian in a
 single frame; prefer the ECU's interpreted value over raw-voltage twins.
 
+**Plausibility gate (v1.2.1).** `udsValuePlausible()` rejects a decoded value
+outside physical range, keyed off the table's `unit` column so no per-DID
+bounds exist. Only temperatures are bounded today (−60 … 1500 °C), because an
+ECU fault code came through `egt_b1s1` as exactly 3003.6 °C (§16.4, defect 4).
+A rejected value is treated like a failed read: the PID is absent from that
+cycle's packet and a `[UDS] <label> implausible` line is printed. The bound is
+deliberately loose so genuine DPF-regeneration EGTs above 1000 °C pass.
+
 ---
 
 ## 8. The Derived-Inputs Group (atomic co-emission)
@@ -316,14 +382,45 @@ tolerate mild misalignment and are not in the group.
 
 ## 9. GNSS Subsystem
 
-**Active mode: `GNSS_STANDALONE`.** The onboard u-blox is reached **through the
-OBD co-processor**, not a dedicated ESP32 UART:
+**Active mode: `GNSS_STANDALONE`.** Two receivers exist and `initGPS()` picks
+one per boot, external first:
 
-- `initGPS()` tries `gpsBeginExt()` (dedicated UART) first; on this TYPE-14 board
-  that times out, so `gpsBegin()` takes over — it issues `ATGPSON` to the
-  co-processor and reads fixes via `ATGPS` (`$GNIFO` parsed by `gpsGetData()`).
-  Boot therefore prints **`GNSS:OK(I)`** (internal-link path).
-- Consequence: **if the co-processor link drops, GPS drops with it.**
+| | External module (primary) | Internal receiver (fallback) |
+|---|---|---|
+| Hardware | u-blox module on the molex header, external antenna | u-blox on the ONE+ board, internal antenna |
+| Data path | NMEA on UART0 RX (GPIO34), decoded by `taskGPS` into `GPS_DATA` | `ATGPSON`/`ATGPS` to the OBD co-processor, `$GNIFO` reply parsed by `gpsGetData()` |
+| Commands to module | UBX bit-banged on GPIO26 (`gpsSendAt`, under a critical section) | none |
+| Power | GPIO12 | co-processor |
+| Boot line | `GNSS:EXTERNAL` | `GNSS:INTERNAL  <-- external module NOT detected, external antenna is unused` |
+| Chime | short rising two-note ping (G6→D7) | low descending three-note grumble (G5→E5→A4) |
+| `hdop` on the wire | **HDOP × 10** (`TinyGPS::hdop()/10`) | **HDOP × 100** (`$GNIFO` field unscaled) |
+| Fails with | nothing else | the co-processor link — if it drops, GPS drops with it |
+
+**Detection (`gpsBeginExt()`, v1.3.2).** The module ships at 115200 and must
+end up at 38400 because UART0 is shared with the console. Each boot:
+samples the RX pin idle level before and after power (a live UART idles high);
+waits 1.5 s for the module to boot; **sweeps the receive rate** by re-clocking
+UART0 through 115200, 38400, 9600, 57600, 19200, 4800, 230400, listening up to
+2 s each and stopping at the first checksum-valid sentence; prints one probe
+line per rate (byte count, good/bad sentences, first 24 bytes); then, if the
+rate found is not 38400, sends u-blox `CFG-VALSET` `CFG-UART1-BAUDRATE`=38400
+on the **RAM layer** (so nothing is written to the module's flash) at the
+module's rate and verifies at 38400. A module that refuses to move keeps the
+console at its rate: GNSS data is the product, log lines are not. Detection
+counts checksum-valid NMEA sentences, which a u-blox emits with or without a
+fix, so **sky view cannot cause a fallback**; only an absent, unpowered or
+unwired module can. How this was arrived at: §16.4 defect 3, §16.6, §16.7.
+
+**The fallback is latched for the trip.** `initGPS()` runs only while
+`STATE_GPS_READY` is clear, and the watchdog below only fires with *no* GPS data,
+which the internal receiver prevents. Every parked period ends in
+`ESP.restart()`, so each trip re-probes from scratch. The chime fires on a
+*change* of source, so it announces at boot and on a mid-drive fallback but is
+silent on a watchdog re-init that lands on the same receiver.
+
+**Never powered down.** Since v1.3.0 the receiver stays on and tracking through
+standby, so wake-up is a hot start (TTFF 0 s measured, §16.7). Cutting power in
+standby forced a 94–278 s cold start on every trip (§16.5).
 
 **Why not cellular GNSS:** `CellSIMCOM::setGPS()` in the fork only branches for
 SIM7070 (`AT+CGNSPWR`) vs everything-else (`AT+CGPS`, correct for SIM7600). The
@@ -332,15 +429,19 @@ SIM7070 (`AT+CGNSPWR`) vs everything-else (`AT+CGPS`, correct for SIM7600). The
 no GPS PIDs are emitted. The dead path is left intact; don't switch back without
 first patching `FreematicsNetwork.cpp` for a `CELL_SIM7670` GNSS branch.
 
-**Reading `processGPS()` output:**
-- Time-only `[GNSS]` lines = tracking but no fix (lat/lng still 0); no PIDs added.
-- HDOP on the wire is **HDOP × 10** (`102` = 10.2, marginal; roof antenna → 1–2).
-- `gd->speed` is knots in the raw struct; `processGPS()` writes km/h (× 1.852).
+**What `processGPS()` does with a reading:**
+- A reading with a date **feeds the time anchor first**, before any position
+  check (`TIME.md`). Time-only `[GNSS] <iso-time>` lines mean tracking but no
+  fix: the session is dated, but no position PIDs are added.
+- A reading whose `time` field equals the previous one is skipped (no new fix).
+  A jump of more than 0.001° from the previous accepted position is rejected
+  once and resets the reference, so a single corrupt sentence cannot teleport
+  the track.
+- Position PIDs added: lat, lng, altitude, speed (knots × 1.852 → km/h),
+  heading, and `sat`/`hdop` when non-zero. `sat` is capped at 12 by NMEA 0183's
+  GGA field, so it cannot distinguish the receivers; `hdop` scale can (table
+  above). `hdop = 255` is the external path's "no DOP yet" sentinel.
 - `lastMotionTime` only updates at `kph ≥ 2`, feeding stationary-shutdown.
-- Proven cold-start TTFF on a window sill ≈ 69 s; in-car, under the windscreen on
-  the internal receiver, 2026-09-05 measured **94–278 s**. The receiver is now kept
-  powered through standby so this is paid once per boot, not once per trip
-  (§16.5).
 - **A GPS-less record is not a gap.** Traccar back-fills the last known location
   and marks the row `valid`, so it plots at a stale coordinate. Detect these with
   `fixtime < devicetime`, never with `valid` (§16.5).
@@ -362,6 +463,13 @@ would need a `GNSS_CELLULAR` branch.
 ICM-42627 or ICM-20948, auto-detected. `processMEMS()` averages accelerometer
 samples per cycle (bias-corrected via `calibrateMEMS()`), emits `PID_ACC`, and
 tracks device temperature. Motion feeds both the standby decision and wakeup.
+Gyro and magnetometer are read but not emitted.
+
+Device temperature (`deviceTemp`, whole °C internally, compared against
+`COOLING_DOWN_TEMP`) goes on the wire as **tenths** in PID `0x82`, because that
+is how the Freematics protocol defines it and Traccar divides by 10. It was
+sent as whole degrees until v1.2.1 and read as 2.8–4.3 °C on the server
+(§16.4, defect 5). Without a MEMS the ESP32's own chip temperature is used.
 
 ---
 
@@ -369,14 +477,17 @@ tracks device temperature. Motion feeds both the standby decision and wakeup.
 
 ```
 vehicle stops → motionless timer expires → standby()
-  ├── SD file closed, OBD co-processor slept, MEMS re-calibrated
+  ├── telemetry task: logout, modem off, spool files flushed and closed,
+  │   RAM buffers purged (orphan spool files are re-found at next boot)
+  ├── OBD co-processor slept, MEMS re-calibrated
   ├── GNSS stays powered and tracking  ← never switched off (§16.5)
   └── waitMotion(-1) polls accel until motion ≥ MOTION_THRESHOLD (0.4 G)
-        └── ESP.restart()   ← full reset (RESET_AFTER_WAKEUP = 1)
+        └── ESP.restart()   ← unconditional full reset
 ```
 
 Full reset on wake is intentional: clean cellular re-registration, no stale state
-machine. Stationary thresholds step the data interval 1 s → 2 s → 5 s as the
+machine, and a fresh GNSS probe (§9). It is unconditional — the
+`RESET_AFTER_WAKEUP` macro in `config.h` is not consulted (§5). Stationary thresholds step the data interval 1 s → 2 s → 5 s as the
 vehicle sits (`STATIONARY_TIME_TABLE` / `DATA_INTERVAL_TABLE`). During standby the
 telemetry task pings every `PING_BACK_INTERVAL` (900 s).
 
@@ -392,8 +503,22 @@ for a few ms, which is a residual cold-start risk for the external module.
 ## 12. Cellular / Network Behaviour
 
 - Modem auto-detected via `ATI` (SIM7670G-LN on this unit).
-- `initCell()` does APN setup, registration, IP acquisition.
-- RSSI polled every `SIGNAL_CHECK_INTERVAL` (10 s), logged as `PID_CSQ`.
+- `initCell()` does APN setup, registration, IP acquisition — and, once
+  registered, reads the network's clock with `AT+CCLK?` and offers it to the
+  time anchor as `TIME_SRC_MODEM` (`TIME.md`). This modem returns UTC in the
+  time field despite reporting a `+40` zone; the value is taken as UTC.
+- A successful connect plays `chimeConnected()` (rising C-major arpeggio).
+- The Traccar login/reconnect/ping/logout exchange is the `EV=` event packet
+  (`notify()`); the login reply's `TM=` would set `TIME_SRC_SERVER` but the
+  deployed server does not send it (§16.4).
+- **`transmit()` is not an end-to-end acknowledgement.** It returns whether the
+  modem confirmed `AT+CIPSEND` within 1 s. `false` often means the datagram
+  already left, and the record is spooled and later replayed anyway, so some
+  rows reach Traccar twice (18 % on 2026-09-05, §16.5). Traccar's decoder
+  does not acknowledge data packets; `EVENT_ACK` exists in `teleclient.h` and
+  is never handled. The UDP socket is closed and reopened every 64 packets.
+- RSSI polled every `SIGNAL_CHECK_INTERVAL` (10 s), logged as `PID_CSQ` when it
+  changes.
 - After `MAX_CONN_ERRORS_RECONNECT` (5) consecutive failures the modem is powered
   off with a **3-minute cool-off** to avoid carrier banning.
 - A poor-connection watchdog reconnects if no server sync within
@@ -412,10 +537,58 @@ for a few ms, which is a residual cold-start risk for the external module.
 
 ---
 
-## 14. Storage
+## 14. Storage — the outage spool (`RecordSpool`)
 
-MicroSD, FAT32, `/DATA/<n>.CSV`. The same serialised frames written to UDP are
-appended to the CSV and flushed every ~1 KB.
+The SD card is **not a log**. Since 2026-07-02 (CSV logger removed) it holds
+exactly one thing: packets that could not be sent, so that a cell outage or a
+pre-connect cold-start window leaves no permanent gap at the server.
+
+**Files are the only state.** `/SPOOL/<seq>.PKT`, one file per outage, `seq`
+monotonic and chosen at boot by scanning the directory (`max + 1`). No NVS, no
+high-water mark. Files left over from a previous boot are orphans awaiting
+drain, reported as `[SPOOL] n orphan file(s) pending drain`. A crash mid-drain
+leaves the file in place and the next attempt replays it from byte zero;
+Traccar accepts the resulting duplicates (no unique constraint on
+`(deviceid, devicetime)`).
+
+**Record format.** 2-byte big-endian length, then the exact wire bytes of the
+packet. A record built before the session had a UTC anchor is written by
+`appendUnstamped()` with a 13-byte prefix inside the length — marker `0x00`,
+boot ID (4), capture tick (8), big-endian — and is back-stamped on the way out
+(`TIME.md` §4). A stamped record begins with the device ID, which is always
+alphanumeric, so the marker is unambiguous. The outage file is `flush()`ed
+every 30 records, bounding power-cut loss while keeping the FAT entry honest.
+
+**When records enter the spool** (telemetry task, `main.cpp`):
+
+- a live `transmit()` returns false → the packet just built is appended, and
+  the outage file opens if none is open (`[SPOOL] outage start`);
+- the link is down → `spoolQueuedBuffers()` moves every filled RAM buffer to
+  the spool, oldest first, before each connect attempt and once a second during
+  the 3-minute reconnect cool-off, so the 32-slot ring never has to drop a
+  record while offline;
+- standby → `closeForStandby()` flushes and closes both handles before the
+  restart.
+
+**When records leave.** The first successful live transmit after an outage
+calls `endOutage()`, closing the active file (`[SPOOL] outage end n record(s)`).
+`drainOneRecord()` runs only when the live producer has nothing queued, so live
+data keeps first refusal on the cell link: oldest file first, one record per
+call, ~10 records/s when fully idle, naturally interleaved with live packets
+otherwise. The file is unlinked when its last record has gone. Preconditions
+and drop rules:
+
+| Condition | Action | Log line |
+|---|---|---|
+| no time anchor yet | wait (nothing is sent untimed) | — |
+| unstamped record from a different boot | drop the record | `stale-boot record dropped` |
+| unstamped record, anchor present | back-stamp, send | — |
+| transmit fails | leave the record, close the handle, retry next pass | — |
+| truncated header/payload or length > `SERIALIZE_BUFFER_SIZE + 13` | drop the **file** | `short header` / `short payload` / `bad length` |
+| end of file | unlink | `drained` |
+
+Record production stalls during the blocking modem reconnect, so an outage
+window holds fewer rows than the same time live; duplicates are expected (§12).
 
 ---
 
@@ -436,6 +609,16 @@ Timing/behaviour is verified by capture, not value assertions:
    `reduct_line_press` swings through 0, binary-fraction signals read ~99–100 %.
 5. **Engine-off placeholders** (not bugs): lambda DIDs pin ~31.99 and
    `scr_cat_eff` reads 0.000 until sensors/CAT are hot.
+6. **Time stamping:** every `[DAT]` line ends with `10:`/`11:`/`300:`. On a
+   cold start expect `[TIME] anchor MODEM …` within seconds of registration,
+   then `[TIME] anchor GNSS … (MODEM was off by Ns)` with N in single digits;
+   tens of thousands means the modem's CCLK zone convention has changed
+   (§16.4). Spool drains should show `[SPOOL] draining` only after an anchor
+   line.
+7. **GNSS source:** the boot line and the chime agree (`GNSS:EXTERNAL` with the
+   rising ping); the probe table shows a checksum-valid sentence at some rate
+   and `external module at 38400`. In Traccar, `hdop` p50 around 5 means the
+   external path, around 80–100 means internal (§9).
 
 **Reference signatures** (useful sanity checks): at key-on→start, oil pressure
 jumps ~1.0→2.6 bar and fuel-reg duty ~9→19 %, while coolant/EGT lag (thermal
@@ -445,655 +628,223 @@ On this throttle-less diesel, `0x103C` IMAP ≈ ambient at idle is correct.
 
 ---
 
-## 16. Field Observations — GNSS Reliability Baseline (pre-external-antenna)
+## 16. Field Observations
 
-> **Snapshot: 2026-06-01.** This is a *measured baseline*, not a design decision —
-> it records the GNSS behaviour of the **internal antenna** (co-processor
-> `GNSS:OK(I)` path, §9) so a future re-log after the external antenna is fitted
-> can be compared against the same numbers. Re-run the analysis after ~1 week of
-> driving and update this section with an "after" column.
+What the deployed device actually did, measured from the SD card (§16.0) and
+then from Traccar's Postgres (§16.1 onward, `tools/traccar_baseline.py` and
+ad-hoc SQL). Each dated subsection keeps its method and numbers so a future
+re-run is comparable; the reasoning that led to each fix lives with the fix
+(§9, §12, §14, `TIME.md`, `CHANGELOG.md`) and is not repeated here.
 
-**Dataset:** full SD card dump (`/DATA/*.CSV`), 104 of 121 files non-empty,
-**52,346 logged cycles**. The 17 empty/near-empty files are reboot/wake churn
-(each file is one session between `ESP.restart()` events, §11).
+**Status as of 2026-09-09 (v1.3.2 in the car):**
 
-**Method (reproducible):** flat `PID,value` lines are grouped into per-cycle
-records (a new cycle begins whenever a PID repeats, since no PID appears twice in
-a cycle). A record "has a fix" if it carries both `A` (lat) and `B` (lng). The
-key trick is using **OBD vehicle speed `10D` as an independent motion reference**
-— it tells us the car was moving even when GNSS produced nothing, which
-separates "no fix while driving" from "parked / cold-starting."
+| Area | State | Evidence |
+|---|---|---|
+| GNSS fix availability | 100 % of rows, moving or stopped; TTFF 0 s since the receiver stopped being powered down | §16.1, §16.7 |
+| External module / antenna | Detected and carrying the fix: true HDOP p50 0.50 / p90 0.60 vs 0.86 / 1.58 internal | §16.7 |
+| Record timestamps | Every row carries capture time; zero-lag rows 33 % → ~0; spool drains replay at capture time | §16.3, §16.4, §16.5 |
+| Spool / backfill | Working through cell outages (lag up to 1738 s replayed) | §16.5 |
+| Finding B (payload blackout) | Did not recur in 44+ sessions; closed as a one-off | §16.4 |
 
-**Findings:**
+**Open items, in rough priority:**
 
-- **39.9 %** of all cycles (20,870 / 52,346) carried **no position**, while OBD
-  logged normally — so the device was alive and writing to SD throughout.
-- **35.7 %** of *moving* cycles (OBD speed ≥ 5 km/h) had **no fix** (13,899 /
-  38,921). This is position loss while genuinely driving, not while stationary.
-- The failure is **bimodal, not gradual.** Of 58 real drives (files with ≥ 20
-  OBD-speed samples): **33 good** (≥ 50 % coverage), **9 partial**, **16 with
-  zero fix for the entire drive** (files 12–15, 18, 19, 21, 23, 25–28, 36, 38, 66,
-  120). Examples: `21.CSV` — 1848 records, 0 fixes, up to 82 km/h; `25.CSV` — up
-  to 111 km/h, 0 fixes.
-- **When it does lock, reception is healthy:** satellite count peaks at 9–12
-  (18,539 samples at 12 sats), HDOP good (remember the wire value is HDOP × 10,
-  §9). Gradual signal weakness would show many marginal 3–4-sat fixes; we don't
-  see that. "Solid lock or total silence" is the signature of an **intermittent
-  antenna / connector (or GNSS failing to init on some boots)** — not a
-  reception-quality problem. The zero-fix drives cluster (files 12–28), consistent
-  with a physical connection bad for a stretch.
-- **Standby churn amplifies it.** With `GNSS_ALWAYS_ON = 0` (§11), GPS cold-starts
-  on every wake (TTFF ≈ 69 s per §9). Several files take 400–600 cycles to their
-  first fix, and short post-wake segments end before a fix ever arrives.
-  *(Confirmed and fixed 2026-09-05 — this turned out to be a far larger share of
-  the loss than assumed here; the receiver is no longer powered down. See
-  §16.5.)*
+1. **Duplicate deliveries, ~18 % of rows** — no end-to-end ack (§12); handled
+   in the `vorsprung` SQL views for now. Firmware fix would be a per-record
+   sequence number. (§16.5)
+2. **`egt_b1s2` scaling** — 1000–1300 °C during DPF regeneration is real
+   behaviour but above what that sensor should reach; formula unverified. (§16.4)
+3. **Traccar `totalDistance` is unreliable** — out-of-order replay arrivals
+   corrupt it server-side; the reporting layer uses the odometer DID instead.
+   Should have improved after v1.2.1 but was not re-measured. (§16.4)
+4. **`TM=` in the login reply** — a four-line Traccar change would give the
+   device an authoritative server clock one round-trip after modem-up. (§16.4)
+5. **`traccar_baseline.py cmd_stats` measures `valid`**, which Traccar sets on
+   back-filled positions too; it overstates fix availability. Measure payload
+   presence (`sat`/`io768`) instead. (§16.4)
+6. **One 140 s mid-drive gap on 2026-09-09 was not backfilled.** Cause unknown,
+   seen once. (§16.7)
+7. **Wake-up GPIO12 blip** — `ESP.restart()` interrupts the external module's
+   power for a few ms; TTFF 0 s says the module rides it out. (§16.5)
+8. **External antenna mounting** — fitted loose-laid on 2026-06-19; re-confirm
+   HDOP after it is permanently dressed. (§16.1)
+9. **1NCE SIM migration** pending. (§13)
 
-**Conclusion — the core issue is lost *fix*, not lost *transmission*.** The gaps
-seen at the Traccar server are also gaps on the SD card: the position was never
-captured, so there was nothing to transmit. This was the question that drove the
-analysis, and it settles the solution space:
+**How to measure, learned the hard way:**
 
-- **Cellular GNSS would not help** — it is the modem's own *satellite* receiver
-  (and unimplemented for the SIM7670G anyway, §9); same failure mode, different
-  antenna.
-- **Store-and-forward / SD backfill would not have helped** — nothing was logged
-  to forward.
-- **External GNSS antenna (pending)** targets the root cause directly; expected to
-  be the primary fix. Check the physical connector too — the bimodal pattern
-  smells like a loose u.FL.
-- **CAN-bus GNSS from the car's nav unit is the chosen plan-B** — the only
-  genuinely *independent* source (car roof antenna + its own receiver). Deferred
-  until the external antenna is evaluated; if pursued, it needs (1) VCDS capture
-  of the nav-unit request/response CAN IDs and lat/lng/time DIDs + scaling, and
-  (2) a reachability spike confirming those DIDs are routable through the gateway
-  from the OBD port. Integration would follow the atomic `readGroup()` pattern
-  (§8) with a staleness gate so it only fills when the u-blox is stale; coordinates
-  need a dedicated scaled-`int32`→float decoder (the generic `udsDecodeU32_4b`
-  overflows float's exact-integer range for degrees × 1e7).
-- **Standby / `GNSS_ALWAYS_ON` tuning** is a cheap, independent win that removes
-  the cold-start amplifier regardless of the antenna outcome. *(Done 2026-09-05,
-  §16.5 — it was not merely an amplifier: cold-start churn alone accounted for
-  8.3 % blind time and ~16 % of plotted distance.)*
+- Use **OBD speed `10D` as the motion reference**. It says the car was moving
+  even when GNSS produced nothing, which separates "no fix while driving" from
+  "parked".
+- **Never use Traccar's `valid` for fix availability.** The decoder back-fills a
+  GPS-less row with the last known position and marks it valid. Count GNSS
+  payload presence (`sat`/`io768`), or `fixtime < devicetime`.
+- **`hdop` scale depends on the receiver** (×10 external, ×100 internal, §9);
+  it is the receiver fingerprint. **`sat` is not**: NMEA caps it at 12.
+- **A mis-stamped live row and a real spool drain both show large
+  `servertime − devicetime` lag.** A drain's lag spread matches its capture
+  window (ratio ~0.75–0.94); a mis-stamp's collapses (~0.1–0.3). `TIME.md`.
+- **Zero-lag rows (`devicetime = servertime`) are the arrival-stamp signature.**
+  They should be ~0 % since v1.2.1.
+
+### 16.0 GNSS reliability baseline, internal antenna — 2026-06-01
+
+Full SD dump, 52,346 logged cycles across 104 files (one file per session
+between restarts). A cycle "has a fix" if it carries both `A` and `B`.
+
+- **39.9 %** of all cycles carried no position while OBD logged normally.
+- **35.7 %** of *moving* cycles (OBD ≥ 5 km/h) had no fix.
+- **Bimodal:** of 58 real drives, 33 good (≥ 50 % coverage), 9 partial, **16
+  with zero fix end-to-end** (e.g. 1848 records at up to 82 km/h, 0 fixes). When
+  locked, reception was healthy (9–12 sats). Solid lock or total silence is an
+  antenna/connector signature, not weak reception.
+- Standby power-down cold-started GNSS on every wake; several files took
+  400–600 cycles to first fix. (Confirmed as the dominant cause in §16.5.)
+
+**Conclusion:** the gaps at the server were gaps on the SD card too — lost
+*fix*, not lost *transmission*. Cellular GNSS and store-and-forward would not
+have helped; an external antenna would. A CAN-bus nav-unit GNSS plan-B was
+parked after §16.1 (it would need a VCDS capture of the nav unit's DIDs, a
+gateway-reachability spike, and a scaled-`int32` decoder).
 
 ### 16.1 After external antenna fitted — 2026-06-19
 
-> **Snapshot: 2026-06-19.** External u-blox antenna fitted (loose-laid, not yet
-> mounted/dressed) and the car driven for a long afternoon trip. Same comparison
-> method as above, but against Traccar's Postgres (`tc_positions`) rather than
-> the SD dump, since the device is back online and transmitting.
+External antenna fitted loose-laid. 36 h, 17,307 rows, 11 sessions including a
+170-minute drive; Postgres `tc_positions`, same motion reference.
 
-**Dataset:** 36-hour window ending 2026-06-19 11:16 UTC, device `Allroad`,
-**17,307 rows** across 11 drive sessions — including a
-170-minute afternoon drive (session #10, 05:40–08:30 UTC = 15:40–18:30 AEST,
-9,882 rows) and a 94-minute return (session #11, 5,328 rows). OBD speed `10D`
-used as the independent motion reference as before.
-
-| Metric | Pre (internal antenna) | Post (external antenna) |
+| Metric | Internal antenna | External antenna |
 |---|---|---|
-| Rows with **no fix**, overall | 39.9 % | **0.0 %** (0 / 17,307) |
-| Rows with **no fix**, while moving (OBD ≥ 5 km/h) | 35.7 % | **0.0 %** (0 / 13,949) |
+| Rows with no fix, overall | 39.9 % | **0.0 %** (0 / 17,307) |
+| Rows with no fix, moving (OBD ≥ 5 km/h) | 35.7 % | **0.0 %** (0 / 13,949) |
 | Drives with zero fix end-to-end | 16 / 58 | **0 / 11** |
-| Satellite count (median) | mixed, often 0 | **12** |
-| Inter-row cadence — p50 / p90 / p99 | — | 0.98 s / 2.0 s / 4.5 s |
+| Satellite count (median) | mixed, often 0 | 12 |
+| Inter-row cadence p50 / p90 / p99 | — | 0.98 / 2.0 / 4.5 s |
 
-**Conclusion — the external antenna resolves the GNSS reliability issue.** The
-bimodal "solid lock or total silence" failure has not occurred in any session in
-this window; every moving sample carried a valid fix. Position track over the
-afternoon drive spans ~59 km N–S and 1.6° of longitude with GPS speed tracking
-OBD speed cleanly (e.g. 110 km/h GPS vs 110 km/h OBD on the freeway leg).
+Resolved the bimodal failure. Median stored `hdop` 5 (true 0.5). `hdop = 255`
+on a few rows is the "no DOP yet" sentinel. The `sat` values up to 59 seen here
+were later shown to be NMEA corruption artefacts, not a constellation count
+(§16.7). Antenna still to be permanently mounted (open item 8).
 
-**Caveats noted but not blocking:**
+### 16.2 Post-v1.1.0 field check — 2026-07-13, re-checked 2026-07-25
 
-- `hdop` reports `255` on a handful of rows — sentinel for "no DOP available yet"
-  while `valid=true` from a cached fix. Median hdop is 5 (i.e. 0.5 once the
-  ×10 wire scaling is reversed, §9).
-- `sat` outliers (min 1 during warm-up, max 59) suggest the new module is
-  reporting combined GNSS-system count in a single field; doesn't affect
-  position quality.
-- Antenna is **not yet permanently mounted** — wire run still needs to be hidden
-  and the puck fixed down. Re-confirm after mounting to make sure the cable
-  dressing doesn't introduce a connector flex problem.
-- **Plan-B (CAN-bus nav GNSS)** is therefore parked, not abandoned. No further
-  VCDS / gateway spike needed unless the external antenna regresses after
-  mounting.
+25,961 rows over ~60 h after the v1.1.0 flash (hardened NMEA parser, date PID,
+external GPS on UART0 RX). Re-check: 288 h, 41,199 rows.
 
-### 16.2 Post-v1.1.0 field check — 2026-07-13
+**Verified:** no phantom-midnight rows; transport healthy (cadence p50 0.87 s);
+one real 63 s outage replayed with correct devicetimes. The outage hole itself
+holds no rows because the blocking modem reconnect stalls record production —
+accepted tradeoff.
 
-> **Snapshot: 2026-07-13.** First field data review since the v1.1.0 flash
-> (2026-07-11: hardened NMEA parser, date PID, external GPS on UART0 RX).
-> Same Postgres method as §16.1. Window: everything since the flash —
-> **25,961 rows** over ~60 h, 11 drive sessions.
+**Finding A — GPS-less records carried no timestamp.** `processGPS()` wrote the
+time PIDs only when it had a date, so a record built between GNSS updates had
+no time at all and Traccar arrival-stamped it. Exact partition: the rows with
+`servertime ≡ devicetime` were precisely the rows lacking `sat`/`io768`.
+Harmless live (< 1 s); on a spool drain every such record landed at drain time
+— old idle-engine content interleaved into a live 85 km/h stream, a
+281-row "session" in 60 s, `totalDistance` jumping backwards by kilometres.
+17 % of rows on 07-13, **33 %** by 07-25, a burst roughly once a day. Fixed in
+v1.2.0 (§16.3, `TIME.md`).
 
-**Verified good:**
+**Finding B — a ~25-min GNSS payload blackout on 2026-07-13**, masked by the
+fix metric (Traccar carried the position forward and reported 100 % valid).
+GPS payload in 3.6 % of records against 72–97 % in healthy sessions. Did not
+recur in the next 32 sessions, nor in the 44 of §16.4; closed as a one-off.
 
-- **Phantom-midnight corruption has not recurred.** No `.000`-ms phantom rows,
-  no corrupt `io768` dates. Heartbeats and a drive segment cross UTC midnight
-  cleanly. The §16-era parser fix is holding in the field.
-- **Transport is healthy.** Inter-row cadence p50 0.87 s / p99 5.2 s. One real
-  cellular outage in the whole window (2026-07-12 03:27:49→03:28:51 UTC, 63 s at
-  ~100 km/h): RAM-buffered rows replayed with correct devicetimes (servertime
-  lag draining 126 s → 4 s), confirming the §14 spool/replay path works at the
-  transport level. The 63 s hole itself contains no rows — consistent with the
-  blocking modem reconnect stalling record production (known design tradeoff,
-  acceptable).
+### 16.3 Monotonic back-stamping — implemented 2026-07-29 (v1.2.0)
 
-**Finding A — records without GPS payload carry no timestamp; spool drains
-mis-date them.** `processGPS()` gates PID `0x10`/`0x11`/`PID_ABS_TIME` on
-`gd->date`, so a record built between GPS updates has *no time information at
-all* and Traccar stamps it with **arrival time**. Exact partition confirmed:
-the 4,399 rows (17 %) with servertime ≡ devicetime are precisely the rows
-lacking `sat`/`io768`. Live this is harmless (<1 s error); on spool drain each
-GPS-less record lands at *drain* time, not capture time. Observed damage:
+Fixes Finding A. Design and mechanism: `TIME.md`. As shipped, the anchor had
+two ranks (GPS over a single network source); v1.2.1 split the network source
+(§16.4). The CAN-clock alternative was dropped: local time with DST, no
+position, itself GPS-sourced, and UDS filter work to fix only the timestamp
+half. No Module 17 code ever existed in this firmware.
 
-- Old idle-engine content (OBD 0–4 km/h, rpm ~780, 12.0 V battery) interleaved
-  into a live 85 km/h stream at reconnect (7/12 03:20:30, 7/11 04:42:30) —
-  wrong time *and* wrong position (Traccar copies the last live location onto
-  timestampless packets).
-- A **phantom 1-minute "session"** at 2026-07-12 00:02:54: 281 rows in 60 s
-  (4.7 rows/s — faster than live production), 0 % GPS payload, moving-OBD
-  content from an earlier capture, all collapsed onto the drain moment.
-- Server-side `totalDistance` corrupted by the out-of-order arrivals
-  (kilometre-scale backwards jumps around every drain).
+**Verified 2026-07-31:** zero-lag rows 33 % → 1.4 %. One claim from that check
+("back-stamping proven across an overnight park, max lag 36,030 s") was the
+CCLK bug of §16.4, not a drain, and is retracted; back-stamping is proven by
+other events (227 rows, lag 51957→52130 s, spread 172 s against a 232 s
+window). Position for GPS-less rows is unchanged by design: they sort
+correctly now but still carry Traccar's copied-forward fix.
 
-**Finding B — a real ~25-min GNSS payload blackout on 2026-07-13, masked by
-the fix metric.** Drive 06:22–06:51 UTC (real drive; OBD shows the full
-accelerate/decelerate/park profile): GPS payload in only **3.6 %** of records —
-nothing at all 06:22:52→06:37:39 and again 06:39:49→06:49:40. Track frozen at
-three coordinates. `stats` still reported **100 % fix** because Traccar carries
-the last known position forward and marks it `valid`. Healthy sessions run
-72–97 % GPS payload. First blackout since the antenna install; it sits on the
-new UART0 RX path. Recovered on its own (next drive 87 %). Cause unknown —
-needs a serial capture (does `[GNSS]` output stop, or does data flow but fail
-the stale/jump checks?).
+### 16.4 Fourteen-day health check — 2026-08-20 (v1.2.1)
 
-**Re-checked 2026-07-25 (12 days / 288 h, 41,199 rows, no code changes since
-this section was written).**
+336 h, 41,488 rows, 44 drive sessions. v1.2.0 confirmed: zero-lag rows 92.5 %
+pre-fix → 3.8 %. GNSS payload presence (the right metric, replacing `valid`):
+97.2 % overall, per-session min 96.7 %. Five defects:
 
-- **Finding A has worsened, not stabilised.** `devicetime == servertime`
-  rows (the mis-dated GPS-less signature) rose from 17 % to **33 %** of all
-  rows. The phantom-session burst pattern recurs **roughly once a day**
-  (180–300 rows landing in the same arrival-minute: 7/16, 7/18–7/24), each
-  lining up with a morning/evening reconnect after a long parked gap. This is
-  a standing daily corruption, not a rare edge case — it should be
-  prioritised over further re-analysis.
-- **Finding B did not recur.** All 32 real drive sessions in the trailing 12
-  days held ≥ 20 % GPS payload; none came close to the 3.6 % seen on 7/13.
-  Treat it as a one-off on the new UART0 RX path, not a standing issue —
-  deprioritise relative to Finding A.
+1. **`+CCLK` zone double-count.** The modem puts UTC in the time field *and*
+   reports `+40`; subtracting the offset per 3GPP landed the anchor 36000 s
+   early for every record between modem-up and GNSS lock — 525 rows (1.27 %),
+   none with `sat`, and 43 % of the `totalDistance` corruption. Now taken as
+   UTC; `TIME_SRC_NET` split into `MODEM` < `SERVER`; every anchor handover
+   prints the outgoing source's error. Found via the lag-spread tell above.
+   Separately: the login reply carries no `TM=`, so `TIME_SRC_SERVER` never
+   fires; GNSS acquiring *time* ~30–45 s in is what corrects the modem anchor
+   (open item 4).
+2. **VIN rows were junk and arrival-stamped.** `getVIN()` returns the
+   placeholder `EEPR0M-READ-ERR0R` on failure; it reached Traccar on 1,114 of
+   1,179 VIN rows, and those rows were the *entire* residue of zero-lag rows.
+   Traccar's `decodeEvent()` ignores PID tokens and makes no row without a VIN,
+   so validating the VIN alphabet removes the rows rather than fixing them.
+3. **External GNSS module unused since v1.1.0.** Stored `hdop` p50 was 5–6 in
+   June (external, ×10) and 81–106 from 07-13 (internal, ×100); fix-to-fix
+   jitter confirmed HDOP ~1. The antenna had done nothing since the flash and
+   nobody noticed because the internal receiver is good enough. Boot line made
+   loud here; cause in §16.6–§16.7.
+4. **Fault code decoded as a temperature.** `egt_b1s1` = 3003.6 °C on 20 rows
+   (raw 0x76E4). Plausibility gate added (§7.6), loose enough to keep the
+   genuine 1000–1300 °C `egt_b1s2` regeneration readings (open item 2).
+5. **`deviceTemp` sent as whole degrees** where PID 0x82 is tenths; a 28–43 °C
+   device read 2.8–4.3 °C. Fixed at the PID (§10).
 
-**Proposed fixes — item 1 IMPLEMENTED (see §16.3); items 2–4 still pending.**
+`totalDistance`: 737 backward jumps / 392 km in 14 days, 474 of them pairs that
+arrived out of devicetime order; defects 1 and 2 account for most. Not
+re-measured after the fix (open item 3).
 
-1. **Timestamp every record** (fixes Finding A). Bake a device-side epoch into
-   every serialized record, not just GPS-carrying ones: hold a time anchor
-   (last GPS epoch, else network/LOGIN time) plus a `millis()` delta at record
-   build. `PID_ABS_TIME` exists precisely for this; emit it unconditionally
-   once any anchor is known. GPS `0x10`/`0x11` stay gated on `gd->date` as
-   now. Requires Traccar to honour it — the server decoder maps `0x300` to
-   attribute `io768` only, so either (a) also emit `0x10`/`0x11` derived from
-   the anchor epoch, which the stock decoder already turns into devicetime, or
-   (b) patch the server decoder. Option (a) is firmware-only and preferred.
-2. **Make the baseline script measure real GNSS availability** (exposes
-   Finding B instead of masking it). `traccar_baseline.py` must count GPS
-   payload presence (`sat`/`io768` in attributes), not Traccar `valid`; report
-   per-session payload %, and flag zero-lag row bursts (drain signatures).
-   This was already a §16 TODO; Finding B upgrades it to required.
-3. **Instrument the GNSS path for the blackout** (diagnoses Finding B).
-   Serial capture on a real drive; if not reproducible on demand, add a
-   lightweight counter PID (NMEA sentences seen / checksum failures /
-   stale-jump rejections per minute) so the next blackout self-diagnoses from
-   the Traccar side.
-4. *(Optional, lower priority)* Consider draining spool records oldest-first
-   only while a monotonic guard holds, or tagging drained packets, so any
-   future timestampless stragglers can't forge phantom sessions.
+### 16.5 GNSS cold-start churn — 2026-09-05 (v1.3.0)
 
-**Fidelity required vs. fidelity available — what "fix the timestamp" actually
-means.** Item 1's anchor needs to be *good enough*, not perfect; worth stating
-the target and the candidate sources against it explicitly, since the gap
-between them is the crux of the remaining design decision:
+9,131 rows, seven sessions in one day, prompted by gaps on the Grafana map.
 
-- **GPS, when locked:** sub-second UTC timestamp *and* lat/lng in the same
-  fix. This is the reference fidelity — every "good" row in Traccar has this.
-  The whole problem in Finding A is the subset of records built with **no
-  anchor at all** (not degraded fidelity — total absence), which is why they
-  fall back to Traccar's arrival-time stamp.
-- **Network/LOGIN time (existing fallback in item 1's plan):** roughly
-  second-level, UTC, but only available when there's cellular registration —
-  which is not guaranteed to hold exactly when a GPS-less record is being
-  built (both can be down together, e.g. underground/tunnel/parking
-  structure).
-- **Vehicle CAN/UDS clock** (candidate "Plan C", investigated separately —
-  see the sibling `can_sniffer` project, not detailed here): the car's
-  instrument-cluster ECU exposes a diagnostic time/date DID, whole-second
-  resolution, always reachable whenever the OBD link is up (battery-backed,
-  independent of cellular reg). Two fidelity gaps versus GPS that matter for
-  how it'd be used: (1) it's **local wall-clock with DST**, not UTC — needs a
-  timezone/DST correction before use as an anchor; (2) it carries **no
-  position** — wiring it in closes the "record has zero timestamp" defect
-  (Finding A's actual bug) but does *not* give GPS-less records a real
-  position; Traccar would still copy-forward the last known fix for those
-  rows, same as it already does for Finding B's masked blackout. It is also
-  itself GPS-sourced-with-holdover on this platform (confirmed via VCDS: no
-  CAN clock on the bus is independent of GPS), so it degrades gracefully
-  across short reception gaps rather than being a true independent source.
-- **Net:** for Finding A, second-level local-time-corrected-to-UTC is
-  sufficient fidelity — the bug being fixed is mis-ordering/mis-dating on
-  spool drain, not sub-second precision. Sub-second GPS-grade fidelity is
-  not required for the timestamp anchor itself, only for position, which no
-  candidate anchor here provides. So the CAN clock is a plausible fix for
-  the *timestamp* half of Finding A but does not address, and should not be
-  framed as addressing, the *position* half.
-
-### 16.3 Monotonic back-stamping — implemented 2026-07-29
-
-Fixes §16.2 Finding A. Design write-up in `TIME.md`; code in
-`timeanchor.{h,cpp}` plus the spool and packet-build paths.
-
-**The CAN clock (plan C) is dropped.** The fidelity analysis above already
-concluded it fixes only the timestamp half and is itself GPS-sourced with
-holdover; against that, Module 17 polling costs UDS/ISO-TP filter complexity,
-hardware debugging friction, and a local-time-with-DST correction. Nothing in
-this firmware ever targeted Module 17, so there was nothing to remove — the
-`can_sniffer` spike is simply not carried forward.
-
-**Capture tick.** Every record now takes `esp_timer_get_time()` once at the top
-of its `process()` cycle and carries it in `CBuffer::tick`. 64-bit monotonic
-microseconds: no 49-day `millis()` wrap, unaffected by `settimeofday()`.
-`buffer->timestamp` (PID `0x00`, and the buffer manager's ordering key) is now
-derived from that tick rather than an independent `millis()` call.
-
-**Tiered anchor.** One global pair — "at tick M the clock read T" — in
-`timeanchor.cpp`, guarded by a spinlock because the main loop writes it and the
-telemetry task reads it. Sources, by rank:
-
-| Rank | Source | Set from | Notes |
-|---|---|---|---|
-| 2 | `TIME_SRC_GPS` | `processGPS()`, on any valid `gd->date` | Sub-second. Now set **above** the position checks, so a time-only fix still anchors the session |
-| 1 | `TIME_SRC_NET` | `AT+CCLK?` after `cell.setup()`; Traccar login `TM=` | Second-level. Works underground, and lands before the first GNSS fix on a cold start |
-
-A higher rank always replaces a lower one; a lower rank waits until the
-incumbent is 120 s stale. Readings before 2025-01-01 are rejected, which
-catches an un-provisioned modem's 1980 default and mis-parsed NMEA dates.
-The first accepted reading of a session also sets the system clock, so SD
-directory entries and `printTime()` stay honest.
-
-**Stamping is single-sourced.** `processGPS()` no longer writes `0x10`/`0x11`/
-`0x300` into the buffer. `buildPacket()` resolves the record's tick against the
-anchor and writes all three at serialization time, for **every** packet — live
-or spooled, GPS payload or not. This is §16.2 item 1 option (a): Traccar's
-stock decoder rebuilds `devicetime` from the `0x10`/`0x11` pair, so no server
-change is needed. Conversion is hand-rolled (Hinnant civil/days) to keep the
-ESP32's configured timezone out of it; round-trip verified against `gmtime`
-over 316,483 samples spanning 2025–2035, zero mismatches.
-
-**Back-stamping across the pre-anchor window.** Records built before any source
-has reported cannot be stamped at build time, and on a cold start they are
-spooled before the modem is even up. Those go to SD via
-`appendUnstamped()`, which prefixes the record with a 13-byte header — marker
-`0x00`, boot ID, capture tick, big-endian. `drainOneRecord()` resolves the tick
-against the anchor and splices the time PIDs in on the way out
-(`CStorageRAM::load` → `untailer` → stamp → `tailer`), so the record lands at
-capture time, not drain time. Consequences worth knowing:
-
-- **Old spool files still drain.** A stamped record starts with the device ID,
-  always alphanumeric, so pre-existing `.PKT` files read back unambiguously.
-- **Ticks are only comparable within one boot**, hence the boot ID. A record
-  whose boot ID no longer matches is **dropped**, with a log line: its tick is
-  measured from a monotonic clock that no longer exists, and sending it
-  untimed would forge exactly the phantom session being eliminated. This only
-  affects records from a session that never obtained *any* time source before
-  reboot, and it also closes §16.2 item 4.
-- **Drain is gated on the anchor.** `drainOneRecord()` returns early while the
-  device has no clock rather than spending records on arrival stamps.
-
-**RTC-RAM holdover (TIME.md's optional tier 3) was not implemented.** Standby
-busy-waits on MEMS and then `ESP.restart()`s, so ticks reset while the park
-duration stays unknown — a carried-over anchor would be wrong by exactly the
-gap it was meant to bridge. The spool's boot ID handles the same case honestly
-instead.
-
-**What this does not fix.** The position half, unchanged and by design: a
-GPS-less record still has no coordinates, and Traccar still copies the last
-known fix onto it. Correct time now means those rows sort into the right place
-instead of collapsing onto the drain moment, but they remain
-position-by-inference. Finding B is untouched.
-
-**Field verification pending** — needs a flash, then a re-run of the §16.1
-Postgres method looking for: `devicetime == servertime` share falling from
-33 % toward ~0, no same-arrival-minute row bursts, and drained rows landing at
-plausible capture times.
-
-*Verified 2026-07-31 and re-verified over 14 days at §16.4. One claim from the
-original 7/31 check was wrong and is retracted there.*
-
-### 16.4 Fourteen-day health check — 2026-08-20
-
-Re-ran the §16.1 method over 336 h (41,488 rows, 2026-08-07 → 08-20, 44 drive
-sessions) after a 72 h pass surfaced anomalies. §16.3 is confirmed working:
-zero-lag rows fell from 92.5 % pre-fix to 3.8 %, and genuine spool drains
-replay correctly. Four defects came out of it, three of them fixed here.
-
-**Measure GNSS payload, not Traccar `valid`** — §16.2 item 2, finally done.
-Traccar reports 100 % `valid` because it carries the last position forward, so
-the metric cannot see a payload blackout. Counting `sat`/`io768` presence
-instead: **97.2 %** overall, per-session min 96.7 % / p50 99.1 %, zero sessions
-below 50 %. Finding B has not recurred in 44 sessions; treat it as closed.
-
-**Defect 1 — `+CCLK` timezone double-count (fixed).** `networkTime()` subtracted
-the reply's `+zz` offset to convert local time to UTC, per 3GPP TS 27.007. This
-modem does not follow the spec: it puts UTC in the time field *and* reports
-`+40`. The subtraction therefore landed the anchor exactly 36000 s in the past.
-
-The tell that separates this from a legitimate spool replay — and the reason it
-survived the 7/31 check — is **lag spread versus capture window**. A real drain
-holds records spanning the capture window and delivers them at one instant, so
-the spread matches the window (ratio 0.75–0.94 observed). These rows arrived
-*live*, merely mis-stamped, so devicetime tracked servertime and the spread
-collapsed (ratio 0.10–0.32). 11 events / 525 rows (1.27 %) over 14 days, lag
-pinned 36002–36016 s, and **0 of 525 carried `sat`** — exactly the
-pre-GNSS-lock population the mechanism predicts.
-
-*Retraction:* §16.3's "back-stamping proven across an overnight park, max lag
-36,030 s" (7/31, 164 rows) was this bug, not a drain — spread 28 s against a
-189 s window. Back-stamping is still proven, by other events: 7/24 22:29:50,
-227 rows, lag 51957→52130 s, spread 172 s ≈ window 232 s.
-
-Fixed by taking `+CCLK` as the UTC it is. Two pieces of hardening around it,
-since the real failure was that a 10-hour error stayed invisible for a month:
-`TIME_SRC_NET` is split into `TIME_SRC_MODEM` < `TIME_SRC_SERVER` so the two
-network sources stop being last-writer-wins at equal rank; and `timeAnchorSet()`
-now prints, on every handover, how far out the outgoing anchor was. A modem
-whose convention differs now announces itself on the first boot.
-
-*What corrects the anchor today, verified against the deployed decoder in
-`../traccar`:* not `TM=`. `decodeEvent()` answers a login with
-`1#EV=<ev>,RX=1,TS=<ts>` and no `TM=` field, and the fork's local changes touch
-only `decodePosition()` — so `TIME_SRC_SERVER` never fires and the
-`teleclient.cpp` branch feeding it is currently dead. GNSS acquiring *time*
-(before a position fix, hence no `sat` on those rows) is what ends the window,
-~30-45 s in. Kept rather than deleted because the server is ours: adding
-`TM=<epoch>` to that reply is a four-line change that would make the anchor
-authoritative one round-trip after modem-up and *self-correct* a bad CCLK
-reading rather than merely logging it. Recommended follow-up.
-
-**Defect 2 — VIN rows are junk and arrival-stamped (fixed).** `obd.getVIN()`
-signals a failed read in band, returning the 17-character placeholder
-`EEPR0M-READ-ERR0R`; it passed every length check and reached Traccar on 1,114
-of 1,179 VIN rows. The real VIN was last read 2026-08-16.
-
-Separately those VIN rows *are* the residual arrival-stamped rows — 1,179 of
-1,179, an exact partition, none carrying `sat`. That is §16.3's open item 1.
-The cause is server-side: `decodeEvent()` splits the event packet on `=` only
-and reads four keys (ID, VIN, EV, TS), so adding time PIDs to the packet
-achieves nothing — they are parsed off and dropped. It builds the row with
-`getLastLocation(position, null)`: arrival time, previous coordinates.
-
-The lever is that `decodeEvent()` returns `null` when no VIN is present. So
-validating the VIN against its actual alphabet (17 chars, digits plus A–Z less
-I/O/Q — the placeholder's hyphens disqualify it) removes the row entirely
-rather than fixing its timestamp. Item 1 closes as a side effect.
-
-**Defect 3 — the external GNSS module has been unused since v1.1.0 (fixed
-loudly, cause still open).** `initGPS()` falls back to the co-processor
-receiver when `gpsBeginExt()` fails, and said so only via `OK(E)`/`OK(I)`.
-The stored `hdop` scaling is a fingerprint of which path ran — external is
-`gps.hdop()/10` (HDOP×10), internal is `atoi()` of the ATGRR field (HDOP×100):
-
-| week | hdop p50 | path |
-|---|---|---|
-| 2026-05-18 … 06-01 | 79–101 | internal |
-| 2026-06-15 … 06-29 | **5–6** | **external**, HDOP 0.5–0.6 |
-| 2026-07-13 … 08-17 | 81–106 | internal, HDOP ~0.8–1.1 |
-
-The v1.1.0 diff does not touch hdop scaling, so a different path is executing.
-Independently confirmed ×100: stationary fix-to-fix jitter is p50 0.00 m /
-p90 1.25 m over 4,296 samples, which is HDOP ~1, not ~10. So the antenna fitted
-on 2026-06-19 (§16.1) has done nothing since 2026-07-11 — HDOP p50 0.55 → 1.0.
-It went unnoticed because the internal receiver is good enough that fix
-availability and payload both stayed excellent; the midnight bug went away
-because the soft-serial path was *deleted*, not because the new one engaged.
-
-The message is now explicit. Why detection fails is not yet diagnosed —
-`gpsBeginExt()` listens at 38400 and allows ~1.1 s for decodable NMEA, and
-sends `gpsSettings` only *after* success, so a module coming up at a different
-baud can never be detected. Confirm the path from the boot line before
-chasing it.
-
-**Defect 4 — an ECU fault code decoding as a temperature (fixed).**
-`egt_b1s1` reported exactly 3003.6 °C on 20 rows, one fixed value repeated —
-raw 0x76E4 through the J1979 scaling, not a recognisable bit-pattern sentinel.
-Handled with a plausibility bound keyed off the table's `unit` column, applied
-to temperatures only, and treated like a failed read so the PID is simply
-absent that cycle.
-
-The bound is deliberately loose (−60 … 1500 °C) so it does **not** swallow the
-95 `egt_b1s2` rows above 1000 °C. Those are real: they cluster on exactly two
-days, ramp smoothly second-to-second, and coincide with `regen_time` resetting
-96884 → 151 — DPF regenerations, against a 201 °C peak on an ordinary drive.
-They still exceed what that sensor should physically reach, so the `egt_b1s2`
-scaling deserves its own look; that question should not be settled by silently
-discarding the evidence.
-
-**Defect 5 — `deviceTemp` scaled wrong on the wire (fixed).** It held 16
-distinct values spanning 2.8–4.3 across 40,309 rows, which read as a broken
-sensor mapping. Reading the deployed decoder settled it: `case 0x82` does
-`Double.parseDouble(value) / 10.0`, because PID 0x82 is defined in tenths of a
-degree. The firmware was sending whole °C — `deviceTemp` is `(int)temp` and is
-compared directly against `COOLING_DOWN_TEMP` (75 °C) — so a device running at
-**28–43 °C** was reporting 2.8–4.3 °C. Entirely plausible numbers for a winter
-cabin, which is exactly why it looked like a mismapped field rather than a
-factor-of-ten error.
-
-Fixed on the firmware side (`deviceTemp * 10` at the PID, internal semantics
-unchanged) rather than in the fork's decoder, so the wire format keeps matching
-the stock protocol. Resolution stays 1 °C; the reading is truncated to `int`
-before it gets here. Note this makes the thermal-standby threshold newly
-meaningful — at a real 28–43 °C the device was never remotely near the 75 °C
-cutoff, but the reported value had been off by 10× in the safe direction.
-
-**Still open, not fixed here.**
-
-- `egt_b1s2` scaling, per above.
-- `totalDistance` non-monotonicity, revised from §16.3's verdict: 737 backward
-  jumps / 391.9 km over 14 days, of which **474 (389.8 km) are pairs that
-  arrived out of devicetime order**. Defects 1 and 2 account for most of it —
-  14 jumps adjacent to a CCLK row carry 170.3 km (43 %), all eight largest
-  jumps sit on a CCLK boundary, and VIN rows carry 96.5 km — so this should
-  largely resolve with them. Only 18 jumps (10 m total) are otherwise clean.
-  The residue is inherent to legitimate replay arriving out of order and is
-  genuinely server-side.
-
-**Field verification pending** — after flashing, confirm from the console that
-`GNSS:` reports EXTERNAL or INTERNAL, that `[TIME] CCLK "…" taken as UTC`
-matches wall-clock UTC, and that the MODEM→GNSS handover reports a delta of
-seconds rather than ~36000. Then re-run the 336 h query set: expect 10-hour lag
-events to vanish, zero-lag rows to fall to ~0 (VIN rows gone entirely unless the
-adapter starts reading again), and `totalDistance` regressions to drop sharply.
-
----
-
-### 16.5 GNSS cold-start churn and the last-known-location artefact — 2026-09-05
-
-> **Snapshot: 2026-09-05.** Prompted by visible gaps between points on the
-> Grafana map despite the v1.2.0 spool/backfill working. 9,131 rows,
-> 00:14–06:43 UTC, seven driving sessions.
-
-**The spool is not the problem.** Every cellular outage was fully backfilled;
-records arrive with correct `devicetime` and a large `servertime - devicetime`
-lag (up to 1738 s). No rows are missing. The map gaps are rows that carry **no
-position**, not rows that never arrived.
-
-**Traccar substitutes the last known location.** `processGPS()` correctly emits
-no GPS PIDs when there is no fix (`main.cpp`, the `gd->lng == 0 && gd->lat == 0`
-and `lastGPStime == gd->time` returns). Traccar's Freematics decoder fills those
-in from the device's previous position, so the row lands with `valid = true` and
-a stale lat/lon. The tell is **`fixtime` frozen while `devicetime` advances** —
-the offset reached −1031 s in the 06:12 episode. Any coverage metric keyed on
-`valid` + non-zero coordinates therefore reads 100 % when the truth was 91.7 %;
-`tools/traccar_baseline.py cmd_stats` has this bug and should be read with it in
-mind.
-
-**Root cause: the receiver was powered down in standby.** `GNSS_ALWAYS_ON = 0`
-made `standby()` call `sys.gpsEnd(true)`, driving `PIN_GPS_POWER` (GPIO12) low
-for the whole parked period. Every trip therefore began with a full cold start.
-All seven sessions on 2026-09-05 opened with **94–278 s of no position**,
-acquiring from 3–5 satellites and climbing — the unmistakable signature of lost
-ephemeris. This is the amplifier §16 predicted in June and never actioned.
-
-**The 300 s watchdog made it worse.** The `GNSS_RESET_TIMEOUT` recovery in
-`process()` called `sys.gpsEnd()`, whose `powerOff` argument **defaults to
-`true`** (`FreematicsPlus.h`). So the recovery power-cycled the module, forcing
-another cold start that needs 2–4 min — longer than the 300 s timeout that
-triggered it. The loop could never catch up. The 16.9-minute hole at
-06:12:20–06:29:17 is that cycle eating itself.
-
-**Measured impact (deduplicated):**
+**The spool was not the problem:** every outage was backfilled with correct
+devicetime (lag up to 1738 s). The gaps were rows with **no position**, which
+Traccar plots at the last known location. Root cause: the receiver was powered
+down in standby (`sys.gpsEnd(true)` on GPIO12), so every trip began with a
+full cold start — **94–278 s blind at the start of all seven sessions**. The
+300 s watchdog made it worse: its recovery also power-cycled (`gpsEnd()`
+defaults `powerOff` to true), forcing another 2–4 min cold start inside a
+300 s timeout; the 16.9-minute hole at 06:12–06:29 is that loop.
 
 | Metric | Value |
-| --- | --- |
-| GNSS-blind time | 32.2 min of 388.9 min logged (**8.3 %**) |
-| Straight-line "teleport" drawn on the map | **28.6 km** |
-| Real recorded track | 152.0 km |
-| Share of the day's distance that is a straight line, not road | **~16 %** |
+|---|---|
+| GNSS-blind time | 32.2 of 388.9 min logged (**8.3 %**) |
+| Straight-line "teleport" drawn on the map | **28.6 km** of 152.0 km (~16 %) |
+| Duplicate rows | 1,642 extra on 7,489 distinct timestamps (**18 %**) |
 
-**Duplicate replays — 18 % of rows.** 1,642 extra rows on 7,489 distinct
-timestamps. The cause is **not** a missing end-to-end acknowledgement: there is
-no end-to-end acknowledgement anywhere in this design. `inbound()` handles only
-`EVENT_SYNC`; `EVENT_ACK` is defined in `teleclient.h` and never handled, and
-Traccar's freematics decoder does not acknowledge data packets. What
-`TeleClientUDP::transmit()` actually returns is the result of `CellUDP::send()`,
-which writes `AT+CIPSEND` and waits **1000 ms** for the modem to answer
-`+CIPSEND:` (or `RECV FROM:`, also treated as success). False therefore means
-*the modem did not confirm on the AT channel in time*, or returned `ERROR` — by
-which point the datagram has usually already gone out. The record is spooled
-anyway and replayed later. Suspects for the false negative: the 1 s window
-itself, and the `cell.close()`/`cell.open()` the transmit path performs every
-64 packets, which can leave the modem busy for the following send. 977 duplicate pairs **disagree on position**, because an
-identical GPS-less packet arriving twice gets last-known-location substituted
-twice, at different times — two different coordinates. That is the 19.5 km
-saw-tooth at 05:23–05:25, which renders as violent zig-zagging.
+Duplicates come from `transmit()` reporting the modem's 1 s `AT+CIPSEND`
+confirmation, not delivery (§12); 977 duplicate pairs *disagree on position*
+because a GPS-less packet arriving twice gets last-known-location substituted
+twice, producing a 19.5 km saw-tooth. Open item 1.
 
-**External module still not detected.** HDOP p50 = 76 (÷100 scaling) and
-satellite count capped at 12 — the internal receiver. The antenna fitted
-2026-06-19 remains unused, as §16.4 found. Contributing cause: `gpsBeginExt()`
-allowed only 300 ms of settle plus 1.1 s of listening, and a cold-powered module
-needs about a second to boot before its first NMEA sentence.
+**Fixed in v1.3.0:** receiver never powered down (`GNSS_ALWAYS_ON` removed);
+watchdog warm-restarts first and power-cycles only on the second attempt;
+boot chime reports which receiver won; external detection window widened to
+3 s. Verified in §16.7: TTFF 0 s. The wake-up GPIO12 blip (open item 7) is the
+residual risk.
 
-**Fixed in this change:**
+### 16.6 Why the external module was never detected — 2026-09-05 (v1.3.1)
 
-1. **GNSS is never powered down.** `GNSS_ALWAYS_ON` is removed rather than set
-   to 1 — the receiver is on, unconditionally. The NMEA decode task keeps
-   running through standby, so the module holds a live fix across the parked
-   period. Cost is ~25 mA on a device that already stays awake in standby
-   (`waitMotion()` busy-polls the MEMS; the modem pings every 900 s).
-2. **The watchdog warm-restarts first.** `sys.gpsEnd(false)` keeps power and
-   ephemeris; only a module that a warm re-init did not revive gets its power
-   cut on the second attempt.
-3. **The boot chime reports which receiver won.** `chimeGnssExternal()` is a
-   short rising two-note ping (G6→D7); `chimeGnssInternal()` is a low
-   descending three-note grumble (G5→E5→A4), pitched well below both it and
-   `chimeConnected()`. It fires on a change of source, so it announces at boot
-   and on a mid-drive fallback but stays silent on a watchdog re-init that lands
-   on the same receiver. This gives an in-car feedback loop for unplugging and
-   replugging the external module.
-4. **Detection window widened** from 1.1 s to 3 s in `gpsBeginExt()`. The extra
-   1.9 s is only ever spent when no external module answers.
+The v1.3.0 chime reported the *internal* receiver on the first drive with the
+external module plugged in. Detection counts checksum-valid NMEA sentences,
+which a u-blox emits with or without a fix, so sky view was not the cause.
+Diffing `gpsBeginExt()` against upstream: upstream sets the module's baud rate
+*before* listening; the fork, since moving receive onto UART0 in v1.1.0, sent
+nothing and listened at 38400. A module at any other rate was indistinguishable
+from an empty socket. v1.3.1 bit-banged `CFG-VALSET` at four rates before
+listening, open-loop, at 0.3 s and 1.07 s after power. **It did not work**
+(2026-09-07: descending chime every start, 17 raw bytes seen in 3 s). The
+claim made here that the rate "cannot be discovered by listening" was wrong.
 
-**Residual risk — the wake-up blip.** `standby()` still ends in `ESP.restart()`,
-and GPIO12 is an ESP32 strapping pin with an internal pull-down, so power to the
-external module is interrupted for a few milliseconds on every wake regardless
-of this change. Whether the module rides that out depends on its VBCKP backup.
-**Field check:** if TTFF after a stop is now seconds, the change is sufficient;
-if it is still minutes, the next step is to hold GPIO12 through reset or to drop
-`RESET_AFTER_WAKEUP`.
+### 16.7 Bench diagnosis and fix — 2026-09-07 (v1.3.2), verified 2026-09-09
 
-**Field verification pending** — after flashing, confirm the GNSS chime is heard
-and matches the `GNSS:` console line, then re-run the gap analysis: expect the
-per-session blind window to fall from 94–278 s to single-digit seconds,
-GNSS-blind time from 8.3 % toward ~0 %, and the straight-line share from ~16 %
-to negligible. The duplicate-replay and last-known-location issues are server
-side and are **not** addressed here, and remain open.
-
----
-
-### 16.6 Why the external module was never detected — 2026-09-05
-
-The v1.3.0 chime (§16.5, fix 3) did its job on the first drive after flashing:
-it played the low descending grumble, i.e. `GNSS:INTERNAL`. The external module
-was plugged in. So the widened 3 s detection window was not the problem, and
-neither was sky view — worth stating plainly, because it is the intuitive
-suspect and it is wrong. `gpsBeginExt()` decides by counting **checksum-valid
-NMEA sentences** (`TinyGPS::_good_sentences`, incremented on checksum match
-irrespective of `_gps_data_good`), and a u-blox emits well-formed GGA and RMC
-with empty fields from the moment it boots, fix or no fix. A garage cannot
-suppress detection.
-
-**What upstream does that this fork does not.** Diffing `gpsBeginExt()` against
-`stanleyhuangyc/Freematics@master`:
-
-| | upstream | this fork (pre-v1.3.1) |
-|---|---|---|
-| receive path | hardware UART at the `baudrate` argument, default **115200** | UART0 console RX, fixed **38400** |
-| before listening | sends a UBX `CFG-VALSET` setting the module to 38400 (soft-serial path), or opens the UART at 115200 | **sends nothing** |
-| after detecting | applies `gpsSettings` (message rates) | applies `gpsSettings` |
-
-Both upstream paths establish the rate *before* deciding whether a module is
-present. The fork removed that step when it moved receive onto UART0 in v1.1.0
-(the soft-serial deletion, §16.2) and kept only the post-success
-`gpsSettings` — which the module can never receive, because it is sent only on
-a success that a rate mismatch prevents. A module that came up at anything but
-38400 was therefore permanently undetectable, and produced exactly the same
-observable as an empty socket: no valid sentences. That is the whole of the
-2026-07-11 → present regression, and it is consistent with everything §16.4
-measured (HDOP p50 0.55 → 1.0, ×10 → ×100 scaling, satellite count capped at
-12).
-
-**Fix (v1.3.1).** Before listening, bit-bang `CFG-VALSET` with
-`CFG-UART1-BAUDRATE` (key `0x40520001`) = 38400 on the **RAM layer** at 38400,
-115200, 9600 and 57600 in turn. A packet at the wrong rate is framing noise the
-module discards; the one at the right rate lands. RAM layer means it re-applies
-each boot and never writes the module's flash. It goes out twice — at 300 ms
-for a module that never lost power on a warm re-init, and again at ~1 s for one
-booting from cold — costing ~1 s that is spent whether or not a module answers.
-Transmit is unaffected by the console's baud because it is bit-banged on
-GPIO26; only the receive side is pinned to `Serial`'s 38400.
-
-**Making the next failure legible.** The failure branch now prints the count of
-raw bytes seen on the receive pin. Non-zero with nothing decoded means wired
-and talking at an unmatched rate (or a framing/level problem); zero means
-nothing is on the pin — a dead module, an unpowered one, or wiring. Those two
-were indistinguishable for two months.
-
-**Fallback stays latched for the trip, deliberately.** `initGPS()` runs from
-`initialize()` only while `STATE_GPS_READY` is clear, and the
-`GNSS_RESET_TIMEOUT` watchdog (§9) only fires after 300 s with *no* GPS data —
-which the internal receiver, once it takes over, prevents. So a boot that lands
-on internal stays internal until the next `ESP.restart()`, which `standby()`
-performs at the end of every parked period, so each trip re-probes from
-scratch. Periodic re-probing mid-drive would tear down and re-point UART0 RX
-for a live gap, to cover only a connector re-seated while driving. Not worth
-it while detection no longer depends on conditions that change during a trip.
-
-**Field verification failed — 2026-09-07.** Descending chime on every start.
-Traccar agreed independently: 2026-08-29 … 09-07 HDOP p50 69–111 (the ×100
-internal scale) and `sat` capped at exactly 12 every day. The raw-byte count
-read **17 in 3 s**. What that meant, and the fix, are §16.7.
-
----
-
-### 16.7 Bench diagnosis: the module speaks 115200 — 2026-09-07
-
-The ONE+ and the external module came out of the car and onto the desk. Bench
-is valid without OBD: the co-processor is on the ONE+ and enumerates over USB,
-so `devType`, the internal fallback and the chime all behave; only OBD/UDS rows
-are absent.
-
-**What v1.3.1 printed:** `external module not detected, 17 raw bytes seen on
-RX`. Neither §16.6 branch fit cleanly — 17 bytes is nearly silence, not a
-stream at the wrong rate — so the probe was rewritten to answer three separate
-questions in one boot rather than guess again.
-
-**What v1.3.2 printed, first boot:**
+Device and module on the desk (valid without OBD: the co-processor enumerates
+over USB, only OBD/UDS rows are absent). First v1.3.2 boot:
 
 ```
 [GNSS] rx pin idle-high: 0% unpowered, 98% powered
@@ -1105,104 +856,33 @@ questions in one boot rather than guess again.
 GNSS:EXTERNAL
 ```
 
-Read top to bottom:
+Wiring and power were fine (pin idles high only when powered). **The module
+ships at 115200**, upstream's own `gpsBeginExt()` default. Idling without a fix
+it sends one ~27-byte `$GNRMC` per second, which at 38400 decodes to ~10 bytes
+of framing garbage — so v1.3.1's "17 bytes" *was* the wrong-rate signature.
+v1.3.1's coercion missed because a cold u-blox needs ~1 s before its UART
+accepts input and an interrupt mid-byte at 115200 corrupts the UBX checksum;
+it never checked. v1.3.2 listens first, then configures at the rate found
+(mechanism in §9). Two state leaks fixed in passing (`gpsBegin()` zeroing the
+power pin; `FLAG_GNSS_USE_LINK` not cleared on re-probe). Ruled out at the
+desk: `F_CPU` vs real clock, `analogRead(A0)` (GPIO36, not 34),
+`Serial.setPins(34, -1)`.
 
-1. **Wiring and power are fine.** The receive pin sits LOW with GPIO12 low and
-   idles HIGH (98%) with it high — a live UART transmitter behind the molex,
-   switched by the power pin as designed. One line, and the whole "molex wiring
-   and GPIO12" branch of §16.6 is closed.
-2. **The module ships at 115200.** Which is also the default argument of
-   upstream's `gpsBeginExt(int baudrate = 115200)` — the clue was in the
-   signature the whole time. The `<C3><FD>` pairs at 38400 are 115200 data
-   sampled three times too slowly.
-3. **The module accepts `CFG-VALSET`.** Sent at 115200, after it had booted, it
-   moved to 38400 on the first attempt and the verify probe decoded at 38400.
+**Field verified 2026-09-09**, two drives, 3,045 rows:
 
-**Why 17 bytes was the wrong-rate signature after all.** The §16.6 assumption
-that a u-blox at any wrong rate would land hundreds of raw bytes in 3 s was
-wrong for *this* module: idling without a fix it emits one short `$GNRMC` per
-second, ~27 bytes. At 38400 that decodes to ~10 framing-garbage bytes per
-second. So the v1.3.1 count was consistent with "wired, wrong rate" — the
-branch §16.6 nominated first — and the diagnosis there was right. Only the
-coercion was wrong.
-
-**Why the v1.3.1 coercion missed.** It shouted at 115200 — the correct rate was
-in its list — at 0.3 s and 1.07 s after applying power, with interrupts
-enabled. A u-blox from cold needs about a second before its UART is accepting
-input, so the first send was certainly lost and the second was on the edge; and
-a FreeRTOS tick landing mid-byte at 115200 (8.7 µs per bit) corrupts the UBX
-checksum silently. Open loop, two attempts, no check. It never landed, and
-nothing said so.
-
-**v1.3.2 closes the loop.** `gpsBeginExt()` now:
-
-- samples the receive pin before and after power (the idle-high line above);
-- waits 1.5 s for the module to boot, once, up front;
-- **sweeps the receive rate** — `Serial.updateBaudRate()` re-clocks UART0 — at
-  115200, 38400, 9600, 57600, 19200, 4800, 230400, listening up to 2 s each,
-  moving on after 1 s of silence, stopping at the first checksum-valid sentence;
-- prints a per-rate line with byte count, good/bad sentence counts and the first
-  24 bytes (printable as text, else `<hex>`), all deferred until UART0 is back
-  at 38400 so the console can carry it;
-- if the rate found is not 38400, bit-bangs `CFG-VALSET` at *that* rate (three
-  times, each byte under a critical section — `gpsSendAt()`), then verifies at
-  38400. If the module refuses to move, the console UART is re-clocked to the
-  module's rate and stays there: GNSS data is the product, log lines are not.
-
-§16.6's claim that the module's rate "cannot be discovered by listening" is
-withdrawn; it was never true, only unexamined.
-
-Two state leaks fixed in passing, found by reading for the bug and neither the
-cause of a first-boot failure: `gpsBegin()` zeroed `m_pinGPSPower` on success,
-so any later external probe in the same boot ran unpowered; and `gpsBeginExt()`
-never cleared `FLAG_GNSS_USE_LINK`, so after an internal fallback its own
-`gpsEnd()` took the co-processor branch — leaking the decode task and leaving
-console RX on GPIO34. `taskGPS.create()`'s result is now checked and reported.
-
-**Ruled out at the desk, do not re-investigate:** `F_CPU` vs the real clock
-(`board_build.f_cpu` = 160 MHz matches the SDK's `CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ`,
-`CONFIG_PM_ENABLE` unset — `softSerialTx()` timing is correct); `analogRead(A0)`
-in the telemetry loop (A0 is GPIO36, not 34); `Serial.setPins(34, -1)` (IDF
-accepts an input-only pin as UART RX).
-
-**Field verified — 2026-09-09.** Two drives (25 min / 36 min, 3,045 rows).
-The external module is carrying the fix.
-
-| | internal (v1.3.1, 09-01…09-07, 17 drives) | external (v1.3.2, 2 drives) |
+| | internal (v1.3.1, 17 drives) | external (v1.3.2, 2 drives) |
 |---|---|---|
 | stored `hdop` p50 / p90 | 86 / 158 | 5 / 6 |
 | **true HDOP** p50 / p90 | **0.86 / 1.58** | **0.50 / 0.60** |
-| fix availability | 100% | 100% |
-| moving-row fix | 100% | 100% |
-| time to first fix | 0 s | 0 s |
+| fix availability, moving-row fix, TTFF | 100 %, 100 %, 0 s | 100 %, 100 %, 0 s |
 
-**Read the scale before the improvement.** The two receivers encode HDOP
-differently and the raw column is not comparable: the external path stores
-`TinyGPS::hdop()/10`, i.e. HDOP×10 (`FreematicsPlus.cpp:771`), while the
-internal path stores the co-processor's `$GNIFO` field unscaled at HDOP×100
-(`:735`). So 86 → 5 is *not* a 17× improvement; it is 0.86 → 0.50, a ~42%
-reduction in dilution of precision, and the tail is the better result: p90
-1.58 → 0.60, ~62%. The external antenna makes the fix *tighter and far more
-consistent*, which is exactly what it was fitted for in June.
-
-**Fix availability was never the problem and has not changed** — both receivers
-sit at 100%, moving or stopped, and TTFF is 0 s on both since v1.3.0 stopped
-powering the module down (§16.5). Anyone re-baselining this should measure DOP,
-not fix rate.
-
-**§16.6's `sat > 12` criterion was wrong; it is withdrawn.** GGA's
-"satellites in use" field is capped at 12 by NMEA 0183, so both receivers
-report 12 whenever the fix is good, and the June external window shows the same
-p50 of 12. The nine June rows above 12 that the criterion was built on read 59,
-92, 174 and 193 — impossible satellite counts, and artefacts of the bit-banged
-NMEA corruption that v1.1.0 fixed (§16.2). A prediction was inferred from
-nine corrupt rows and it cost nothing only because HDOP settled the question
-independently. **HDOP scale is the receiver fingerprint; satellite count is
-not.**
-
-One 140 s gap in the second drive, mid-session with the engine warm
-(`coolantTemp` 85 either side) — a cell dropout that the spool did not backfill,
-unrelated to GNSS. Not chased; noted here in case it recurs.
+The stored column is not comparable across receivers (×100 vs ×10). The real
+gain is a ~42 % tighter and far more consistent fix (p90 −62 %); fix
+availability was already 100 % on both since v1.3.0, so **re-baseline on DOP,
+not fix rate**. The `sat > 12` criterion proposed in §16.6 is withdrawn (NMEA
+caps the field; the June rows above 12 were corruption artefacts). One 140 s
+mid-drive gap in the second drive was a cell dropout the spool did not backfill
+(open item 6).
 
 ---
 
@@ -1211,9 +891,19 @@ unrelated to GNSS. Not chased; noted here in case it recurs.
 PlatformIO:
 
 ```sh
-pio run -e esp32dev             # compile
-pio run -e esp32dev -t upload   # flash
+cp include/secrets.h.example include/secrets.h   # once; set SERVER_HOST
+pio run -e esp32dev                              # compile
+pio run -e esp32dev -t upload                    # flash
+pio device monitor                               # 38400 baud
 ```
+
+The console is **38400 baud** (§2); `monitor_speed` in `platformio.ini` and
+`Serial.begin()` in `main.cpp` must move together. Bump `FIRMWARE_VERSION`
+and add a `CHANGELOG.md` entry with any behaviour change; the version and
+build timestamp printed at boot are how a flashed binary is identified in a
+serial log. After a flash, bump `data_from` in the `vorsprung` reporting
+schema if the change affects data trust (see `homeassistant/README.md`,
+local only).
 
 **Serial-monitor gotcha (CH340 on this unit, `/dev/cu.usbserial-*`):** for a
 clean reset, **pulse RTS only — never DTR.** On this wiring DTR drives IO0;
@@ -1246,9 +936,11 @@ link-up.
 - **No co-processor firmware changes** — pure ESP32-side C++.
 - **No multi-frame ISO-TP** — single-frame equivalents cover every needed signal.
 - **No 29-bit extended CAN IDs** — this car's diagnostic stack is 11-bit.
-- **Don't change the wire format** — synthetic UDS PIDs (`0x200+`) ride the
-  existing CSV/UDP path.
+- **Don't change the wire format** — synthetic UDS PIDs (`0x200+`) and the time
+  triplet ride the stock Freematics UDP protocol, so a stock Traccar decoder
+  still files every row with the right `devicetime`.
 - **Don't rename the upstream SDK** under `libraries/` — it's Freematics' code.
+  Local changes are confined to the GNSS path (§3) and are marked in place.
 - **Don't strip Stanley Huang's BSD copyright** from derived files.
 
 ---
